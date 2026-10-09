@@ -1,4 +1,5 @@
 import {
+  getRecordingPermissionsAsync,
   RecordingPresets,
   requestRecordingPermissionsAsync,
   setAudioModeAsync,
@@ -26,6 +27,7 @@ import {
   type VoiceInputState,
 } from "@t3tools/client-runtime/voice-input";
 import { normalizeVoiceInputDecibels, VOICE_WAVEFORM_SAMPLE_COUNT } from "./voiceInputMetering";
+import { createVoiceRecordingPermission } from "./voiceInputPermission";
 
 const INITIAL_STATE: VoiceInputState = { phase: "idle", error: null, errorAction: null };
 const VOICE_METERING_INTERVAL_MS = 80;
@@ -34,6 +36,11 @@ const VOICE_RECORDING_OPTIONS = {
   ...(Platform.OS === "android" ? ANDROID_VOICE_RECORDING_FORMAT : null),
   isMeteringEnabled: true,
 };
+
+const voiceRecordingPermission = createVoiceRecordingPermission({
+  get: getRecordingPermissionsAsync,
+  request: requestRecordingPermissionsAsync,
+});
 
 async function releaseVoiceRecordingAudio(): Promise<void> {
   try {
@@ -106,10 +113,7 @@ export function useVoiceInputController(input: {
     controllerRef.current = new VoiceInputController({
       recorder,
       getTranscriber: getLocalVoiceTranscriber,
-      requestPermission: async () => {
-        const permission = await requestRecordingPermissionsAsync();
-        return { granted: permission.granted, canAskAgain: permission.canAskAgain };
-      },
+      requestPermission: voiceRecordingPermission.ensure,
       configureRecording: configureVoiceRecordingAudio,
       releaseRecording: releaseVoiceRecordingAudio,
       deleteRecording: (uri) => new File(uri).delete(),
@@ -151,10 +155,13 @@ export function useVoiceInputController(input: {
 
   useEffect(() => {
     const subscription = AppState.addEventListener("change", (nextState) => {
-      // iOS reports `inactive` while its permission dialog is open. Only the
+      // iOS reports `inactive` while its permission dialog is open, and Android
+      // reports `background` because the dialog pauses the activity. Only the
       // real background state cancels preparation; recorder status handles
       // calls and route interruptions during capture.
-      if (nextState === "background") controller.appMovedToBackground();
+      if (nextState === "background" && !voiceRecordingPermission.isRequesting()) {
+        controller.appMovedToBackground();
+      }
     });
     return () => subscription.remove();
   }, [controller]);
