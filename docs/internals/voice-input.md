@@ -2,8 +2,8 @@
 
 Transcription edits a composer draft. It does not submit an agent turn. Audio is
 temporary client input, and only normal message submission sends the resulting
-text. The current implementation transcribes locally on supported iOS devices;
-environment-backed transcription is not implemented.
+text. Transcription runs in the platform's speech service on supported iOS and
+Android devices; environment-backed transcription is not implemented.
 
 The [shared controller](../../packages/client-runtime/src/voice-input/controller.ts)
 owns the operation while the client supplies capture and transcription. Preparation
@@ -18,3 +18,14 @@ fires would race that work. The [transcription contract](../../packages/client-r
 therefore requires implementations to settle only after their work has stopped;
 the [Apple binding](../../apps/mobile/src/native/voiceTranscription.ios.ts) checks
 cancellation between native calls and discards late results.
+
+The [Android binding](../../apps/mobile/src/native/voiceTranscription.android.ts)
+feeds the finished recording to the system `SpeechRecognizer` through
+`expo-speech-recognition`, which needs Android 13 or later. The recognizer reads
+decoded PCM and trusts the declared format, so the recorder and binding share
+[one format](../../apps/mobile/src/native/voiceRecordingFormat.ts). Without an
+installed on-device language pack the system recognizer may send audio to its
+provider's servers. The module is excluded from iOS autolinking so the iOS app
+does not reference Speech framework APIs without a purpose string, and Android
+needs `RECORD_AUDIO` plus a `RecognitionService` manifest query, which
+`app.config.ts` must not block.

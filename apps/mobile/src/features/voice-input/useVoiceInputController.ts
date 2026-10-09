@@ -10,10 +10,11 @@ import { File } from "expo-file-system";
 import { activateKeepAwakeAsync, deactivateKeepAwake } from "expo-keep-awake";
 import { useFocusEffect } from "@react-navigation/native";
 import { useCallback, useEffect, useId, useRef, useState } from "react";
-import { AppState } from "react-native";
+import { AppState, Platform } from "react-native";
 import { useSharedValue } from "react-native-reanimated";
 
 import type { ComposerEditorSelection } from "../../components/ComposerEditor";
+import { ANDROID_VOICE_RECORDING_FORMAT } from "../../native/voiceRecordingFormat";
 import { getLocalVoiceTranscriber } from "../../native/voiceTranscription";
 import { getNativeShowcaseScene } from "../showcase/nativeShowcaseScene";
 import {
@@ -30,6 +31,7 @@ const INITIAL_STATE: VoiceInputState = { phase: "idle", error: null, errorAction
 const VOICE_METERING_INTERVAL_MS = 80;
 const VOICE_RECORDING_OPTIONS = {
   ...RecordingPresets.HIGH_QUALITY,
+  ...(Platform.OS === "android" ? ANDROID_VOICE_RECORDING_FORMAT : null),
   isMeteringEnabled: true,
 };
 
@@ -220,7 +222,7 @@ export function useVoiceInputController(input: {
 
   return {
     // Store screenshots show the dictation button even on simulators, whose
-    // on-device transcription is unavailable.
+    // platform transcription is unavailable.
     isAvailable: getLocalVoiceTranscriber() !== null || getNativeShowcaseScene() !== null,
     state,
     audioLevels,
