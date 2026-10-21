@@ -1,6 +1,7 @@
 import { RegistryContext, useAtomMount } from "@effect/atom-react";
 import {
   AudioModule,
+  getRecordingPermissionsAsync,
   RecordingPresets,
   requestRecordingPermissionsAsync,
   setAudioModeAsync,
@@ -29,6 +30,7 @@ import {
   preferredMicrophoneInput,
   rememberMicrophones,
 } from "../../lib/microphonePriority";
+import { ANDROID_VOICE_RECORDING_FORMAT } from "../../native/voiceRecordingFormat";
 import { getLocalVoiceTranscriber } from "../../native/voiceTranscription";
 import { mobilePreferencesAtom, updateMobilePreferencesAtom } from "../../state/preferences";
 import { getNativeShowcaseScene } from "../showcase/nativeShowcaseScene";
@@ -39,6 +41,7 @@ import {
 } from "@t3tools/client-runtime/voice-input";
 import { createLazyVoiceRecorder, type LazyVoiceRecorder } from "./lazyVoiceRecorder";
 import { normalizeVoiceInputDecibels, VOICE_WAVEFORM_SAMPLE_COUNT } from "./voiceInputMetering";
+import { createVoiceRecordingPermission } from "./voiceInputPermission";
 import { VoiceInputSession } from "./voiceInputSession";
 
 const INITIAL_STATE: VoiceInputState = { phase: "idle", error: null, errorAction: null };
@@ -53,8 +56,15 @@ const VOICE_RECORDING_OPTIONS = {
   numberOfChannels: RecordingPresets.HIGH_QUALITY.numberOfChannels,
   bitRate: RecordingPresets.HIGH_QUALITY.bitRate,
   isMeteringEnabled: true,
-  ...(Platform.OS === "ios" ? IOS_RECORDING_OPTIONS : ANDROID_RECORDING_OPTIONS),
+  ...(Platform.OS === "ios"
+    ? IOS_RECORDING_OPTIONS
+    : { ...ANDROID_RECORDING_OPTIONS, ...ANDROID_VOICE_RECORDING_FORMAT }),
 };
+
+const voiceRecordingPermission = createVoiceRecordingPermission({
+  get: getRecordingPermissionsAsync,
+  request: requestRecordingPermissionsAsync,
+});
 
 async function releaseVoiceRecordingAudio(): Promise<void> {
   try {
@@ -154,10 +164,7 @@ function useVoiceInputRuntime() {
     sessionRef.current = new VoiceInputSession({
       recorder,
       getTranscriber: getLocalVoiceTranscriber,
-      requestPermission: async () => {
-        const permission = await requestRecordingPermissionsAsync();
-        return { granted: permission.granted, canAskAgain: permission.canAskAgain };
-      },
+      requestPermission: voiceRecordingPermission.ensure,
       configureRecording: configureVoiceRecordingAudio,
       releaseRecording: releaseVoiceRecordingAudio,
       deleteRecording: (uri) => new File(uri).delete(),
@@ -176,10 +183,13 @@ function useVoiceInputRuntime() {
 
   useEffect(() => {
     const subscription = AppState.addEventListener("change", (nextState) => {
-      // iOS reports `inactive` while its permission dialog is open. Only the
+      // iOS reports `inactive` while its permission dialog is open, and Android
+      // reports `background` because the dialog pauses the activity. Only the
       // real background state cancels preparation; recorder status handles
       // calls and route interruptions during capture.
-      if (nextState === "background") controller.appMovedToBackground();
+      if (nextState === "background" && !voiceRecordingPermission.isRequesting()) {
+        controller.appMovedToBackground();
+      }
     });
     return () => subscription.remove();
   }, [controller]);
