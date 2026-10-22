@@ -3230,15 +3230,14 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
         for (const [kind, filePath, additions, deletions = 0] of [
           ["working-tree", "README.md", 1],
           ["working-tree", "root-new.txt", 1],
-          ["working-tree", "proj/a.txt", 2],
-          ["working-tree", "proj/nested/b.txt", 2],
+          ["working-tree", "proj/a.txt", 1],
+          ["working-tree", "proj/nested/b.txt", 1],
           ["working-tree", "proj/untracked.txt", 1],
           ["working-tree", "proj/README.md", 0, 1],
           ["working-tree", "extra/e.txt", 1],
-          ["branch-range", "proj/a.txt", 3],
-          ["branch-range", "proj/nested/b.txt", 3],
-          ["branch-range", "extra/e.txt", 2],
-          ["branch-range", "extra/README.md", 1],
+          ["branch-range", "proj/a.txt", 1],
+          ["branch-range", "proj/nested/b.txt", 1],
+          ["branch-range", "extra/e.txt", 1],
         ] as const) {
           assert.deepStrictEqual(stat(kind, filePath), {
             path: filePath,
@@ -3266,8 +3265,8 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
         assert.include(dirty.diff, "diff --git a/proj/a.txt b/proj/a.txt");
         assert.include(dirty.diff, "diff --git a/proj/nested/b.txt b/proj/nested/b.txt");
         assert.include(dirty.diff, "diff --git a/proj/untracked.txt b/proj/untracked.txt");
-        assert.include(dirty.diff, "+recorded");
-        assert.include(dirty.diff, "+unrecorded");
+        assert.notInclude(dirty.diff, "+recorded");
+        assert.notInclude(dirty.diff, "+unrecorded");
         assert.notInclude(dirty.diff, "+feature");
         assert.include(changes.diff, "+feature");
         assert.include(changes.diff, "diff --git a/extra/e.txt b/extra/e.txt");
@@ -3280,7 +3279,7 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
         });
         const scopedDirty = scoped.sources.find((entry) => entry.kind === "working-tree")!;
         assert.deepStrictEqual(scopedDirty.files, [stat("working-tree", "proj/a.txt")]);
-        assert.include(scopedDirty.diff, "+recorded");
+        assert.notInclude(scopedDirty.diff, "+recorded");
         assert.include(scopedDirty.diff, "+dirty");
         assert.notInclude(scopedDirty.diff, "b.txt");
         assert.strictEqual(scoped.sources.find((entry) => entry.kind === "branch-range")!.diff, "");
@@ -3293,7 +3292,8 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
         const scopedBase = scopedChanges.sources.find((entry) => entry.kind === "branch-range")!;
         assert.deepStrictEqual(scopedBase.files, [stat("branch-range", "proj/nested/b.txt")]);
         assert.include(scopedBase.diff, "diff --git a/proj/nested/b.txt b/proj/nested/b.txt");
-        assert.include(scopedBase.diff, "+feature");
+        assert.notInclude(scopedBase.diff, "+feature");
+        assert.include(scopedBase.diff, "+dirty");
         assert.strictEqual(
           scopedChanges.sources.find((entry) => entry.kind === "working-tree")!.diff,
           "",
@@ -3326,17 +3326,59 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
           ),
         ]);
         assert.deepStrictEqual(dirtyFile, {
-          oldContents: "a-base\nfeature\n",
+          oldContents: "a-base\nfeature\nrecorded\n",
           newContents: "a-base\nfeature\nrecorded\ndirty\n",
         });
         assert.deepStrictEqual(baseFile, {
-          oldContents: "nested-base\n",
+          oldContents: "nested-base\nfeature\nunrecorded\n",
           newContents: "nested-base\nfeature\nunrecorded\ndirty\n",
         });
         assert.deepStrictEqual(addedFile, {
-          oldContents: "",
+          oldContents: "extra\n",
           newContents: "extra\ndirty\n",
         });
+      }),
+    );
+
+    it.effect("shows only uncommitted submodule work in both review views", () =>
+      Effect.gen(function* () {
+        const pathService = yield* Path.Path;
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+        const sub = yield* makeTmpDir("review-sub-head-");
+        yield* initRepoWithCommit(sub);
+        yield* writeTextFile(sub, "tracked.txt", "pin\n");
+        yield* git(sub, ["add", "tracked.txt"]);
+        yield* git(sub, ["commit", "-m", "pin"]);
+        const cwd = yield* makeTmpDir("review-super-head-");
+        yield* initRepoWithCommit(cwd);
+        yield* git(cwd, ["submodule", "add", sub, "salesforce-project"], {
+          GIT_ALLOW_PROTOCOL: "file",
+        });
+        yield* git(cwd, ["commit", "-m", "pin submodule"]);
+        const project = pathService.join(cwd, "salesforce-project");
+        yield* git(project, ["config", "user.email", "test@test.com"]);
+        yield* git(project, ["config", "user.name", "Test"]);
+        yield* writeTextFile(project, "tracked.txt", "pin\nbeyond\n");
+        yield* git(project, ["commit", "-am", "beyond pin"]);
+        yield* writeTextFile(project, "tracked.txt", "pin\nbeyond\ndirty\n");
+        yield* writeTextFile(project, "staged.txt", "staged\n");
+        yield* git(project, ["add", "staged.txt"]);
+        yield* writeTextFile(project, "untracked.txt", "untracked\n");
+
+        const preview = yield* driver.getReviewDiffPreview({ cwd });
+        for (const kind of ["working-tree", "branch-range"] as const) {
+          const view = preview.sources.find((entry) => entry.kind === kind)!;
+          const paths = view.files!.map((file) => file.path);
+          assert.includeMembers(paths, [
+            "salesforce-project/tracked.txt",
+            "salesforce-project/staged.txt",
+            "salesforce-project/untracked.txt",
+          ]);
+          assert.include(view.diff, "+dirty");
+          assert.include(view.diff, "+staged");
+          assert.include(view.diff, "+untracked");
+          assert.notInclude(view.diff, "+beyond");
+        }
       }),
     );
   });
