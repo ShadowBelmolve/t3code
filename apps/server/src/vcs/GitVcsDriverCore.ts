@@ -260,11 +260,6 @@ function directSubmoduleExcludeArgs(
     .map((candidate) => `:(exclude,literal,top)${candidate.slice(prefix.length)}`);
 }
 
-function parseGitlinkCommit(stdout: string): string | null {
-  const match = /^160000 commit ([0-9a-f]+)\t/.exec(stdout);
-  return match?.[1] ?? null;
-}
-
 function mergeReviewDiffSlices(
   parts: readonly ReviewDiffSlice[],
   patchLimit: number,
@@ -3034,39 +3029,6 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
     return found.sort();
   });
 
-  // submodulePaths is sorted, so each ancestor is visited before its children.
-  // Null when that submodule is not in the tree yet.
-  const reviewGitlink = Effect.fn("GitVcsDriver.review.gitlink")(function* (
-    repoRoot: string,
-    superRef: string,
-    target: string,
-    submodulePaths: readonly string[],
-  ) {
-    let sha: string | null = superRef;
-    let parent = "";
-    for (const entry of submodulePaths) {
-      if (entry !== target && !target.startsWith(`${entry}/`)) continue;
-      const revision = sha;
-      if (revision === null) return null;
-      const listed: GitVcsDriver.ExecuteGitResult = yield* executeGit(
-        "GitVcsDriver.review.gitlink",
-        path.join(repoRoot, parent),
-        [
-          "ls-tree",
-          "-z",
-          "--end-of-options",
-          revision,
-          "--",
-          parent ? entry.slice(parent.length + 1) : entry,
-        ],
-        { allowNonZeroExit: true },
-      );
-      sha = listed.exitCode === 0 ? parseGitlinkCommit(listed.stdout) : null;
-      parent = entry;
-    }
-    return sha;
-  });
-
   const prepareUntrackedReviewIndex = Effect.fn("prepareUntrackedReviewIndex")(function* (
     cwd: string,
     pathArgs: ReadonlyArray<string>,
@@ -3151,38 +3113,6 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
     return { baseRef, mergeBase };
   });
 
-  // Branch baseline for one submodule: its own merge-base, including
-  // branch.<name>.t3-merge-base-ref. The superproject gitlink is only the fallback
-  // when HEAD is detached or that lookup fails.
-  const submoduleReviewRef = Effect.fn("GitVcsDriver.review.submoduleRef")(function* (
-    repoRoot: string,
-    submodulePath: string,
-    submodulePaths: readonly string[],
-    gitlinkSuperRef: string,
-  ) {
-    const submoduleCwd = path.join(repoRoot, submodulePath);
-    const name = yield* executeGit(
-      "GitVcsDriver.review.submoduleBranch",
-      submoduleCwd,
-      ["symbolic-ref", "--quiet", "--short", "HEAD"],
-      { allowNonZeroExit: true },
-    ).pipe(
-      Effect.map((branch) => (branch.exitCode === 0 ? branch.stdout.trim() : "")),
-      Effect.catchTags({ GitCommandError: () => Effect.succeed("") }),
-    );
-    const gitlink = () =>
-      reviewGitlink(repoRoot, gitlinkSuperRef, submodulePath, submodulePaths).pipe(
-        Effect.flatMap((sha) =>
-          sha !== null ? Effect.succeed(sha) : readEmptyTreeHash(submoduleCwd),
-        ),
-      );
-    if (!name) return yield* gitlink();
-    const resolved = yield* resolveReviewMergeBase(submoduleCwd, name).pipe(
-      Effect.catchTags({ GitCommandError: () => Effect.succeed(null) }),
-    );
-    return resolved !== null ? resolved.mergeBase : yield* gitlink();
-  });
-
   const readBranchChangeTotals = Effect.fn("readBranchChangeTotals")(function* (
     cwd: string,
     branch: string | null,
@@ -3261,8 +3191,8 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       ...REVIEW_DIFF_ARGS,
       ...(input.ignoreWhitespace ? ["--ignore-all-space"] : []),
     ];
-    // A superproject diff stops at the gitlink. Each checked-out submodule is diffed against the
-    // commit that gitlink records and prefixed so the patch reads as one tree from this root.
+    // A superproject diff stops at the gitlink. Each checked-out submodule is diffed against
+    // its own HEAD, in both views, and prefixed so the patch reads as one tree.
     const submodulePaths = yield* listInitializedSubmodulePaths(cwd);
     const requested = input.file
       ? matchInitializedSubmodule(submodulePaths, input.file.path)
@@ -3382,13 +3312,9 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       submodulePath: string,
       file?: { readonly path: string; readonly previousPath: string | null },
     ) {
-      const base =
-        review.mergeBase === null
-          ? null
-          : yield* submoduleReviewRef(cwd, submodulePath, submodulePaths, review.mergeBase);
       return yield* readRepositoryDiffs(repositorySpec(submodulePath, file), {
         dirty: dirtyRef === null ? null : "HEAD",
-        base,
+        base: review.mergeBase === null ? null : "HEAD",
       }).pipe(
         Effect.catchTags({
           GitCommandError: () => Effect.succeed({ dirty: skippedSlice, base: skippedSlice }),
@@ -3591,10 +3517,6 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
     if (repositoryRoot.length === 0) {
       return yield* reviewDiffFileError(input, "Could not resolve the Git repository root.");
     }
-    const oldRevision =
-      input.sourceKind === "working-tree"
-        ? (input.baseRef ?? "HEAD")
-        : (yield* resolveReviewMergeBase(input.cwd, null, input.baseRef ?? undefined)).mergeBase;
     const submodulePaths =
       input.changeType === "new" || !input.oldPath.includes("/")
         ? []
@@ -3605,22 +3527,17 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
         input.changeType === "new"
           ? Effect.succeed("")
           : oldMatch === null
-            ? readReviewFileAtRevision(input, oldRevision, input.oldPath)
-            : Effect.flatMap(
-                input.sourceKind === "working-tree"
-                  ? Effect.succeed("HEAD")
-                  : submoduleReviewRef(
-                      repositoryRoot,
-                      oldMatch.submodulePath,
-                      submodulePaths,
-                      oldRevision,
-                    ),
-                (sha) =>
-                  readReviewFileAtRevision(
-                    { ...input, cwd: path.join(repositoryRoot, oldMatch.submodulePath) },
-                    sha,
-                    oldMatch.relativePath,
+            ? input.sourceKind === "working-tree"
+              ? readReviewFileAtRevision(input, input.baseRef ?? "HEAD", input.oldPath)
+              : resolveReviewMergeBase(input.cwd, null, input.baseRef ?? undefined).pipe(
+                  Effect.flatMap(({ mergeBase }) =>
+                    readReviewFileAtRevision(input, mergeBase, input.oldPath),
                   ),
+                )
+            : readReviewFileAtRevision(
+                { ...input, cwd: path.join(repositoryRoot, oldMatch.submodulePath) },
+                "HEAD",
+                oldMatch.relativePath,
               ),
         input.changeType === "deleted"
           ? Effect.succeed("")

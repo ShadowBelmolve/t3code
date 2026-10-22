@@ -3235,8 +3235,8 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
           ["working-tree", "proj/untracked.txt", 1],
           ["working-tree", "proj/README.md", 0, 1],
           ["working-tree", "extra/e.txt", 1],
-          ["branch-range", "proj/a.txt", 3],
-          ["branch-range", "proj/nested/b.txt", 3],
+          ["branch-range", "proj/a.txt", 1],
+          ["branch-range", "proj/nested/b.txt", 1],
           ["branch-range", "extra/e.txt", 1],
         ] as const) {
           assert.deepStrictEqual(stat(kind, filePath), {
@@ -3292,7 +3292,7 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
         const scopedBase = scopedChanges.sources.find((entry) => entry.kind === "branch-range")!;
         assert.deepStrictEqual(scopedBase.files, [stat("branch-range", "proj/nested/b.txt")]);
         assert.include(scopedBase.diff, "diff --git a/proj/nested/b.txt b/proj/nested/b.txt");
-        assert.include(scopedBase.diff, "+feature");
+        assert.notInclude(scopedBase.diff, "+feature");
         assert.include(scopedBase.diff, "+dirty");
         assert.strictEqual(
           scopedChanges.sources.find((entry) => entry.kind === "working-tree")!.diff,
@@ -3330,7 +3330,7 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
           newContents: "a-base\nfeature\nrecorded\ndirty\n",
         });
         assert.deepStrictEqual(baseFile, {
-          oldContents: "nested-base\n",
+          oldContents: "nested-base\nfeature\nunrecorded\n",
           newContents: "nested-base\nfeature\nunrecorded\ndirty\n",
         });
         assert.deepStrictEqual(addedFile, {
@@ -3340,86 +3340,45 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
       }),
     );
 
-    it.effect("diffs a submodule branch from its own base, not the superproject pin", () =>
+    it.effect("shows only uncommitted submodule work in both review views", () =>
       Effect.gen(function* () {
-        const allowFile = { GIT_ALLOW_PROTOCOL: "file" };
         const pathService = yield* Path.Path;
         const driver = yield* GitVcsDriver.GitVcsDriver;
-        const sub = yield* makeTmpDir("review-sub-base-");
-        yield* git(sub, ["init", "-b", "master"]);
-        yield* git(sub, ["config", "user.email", "test@test.com"]);
-        yield* git(sub, ["config", "user.name", "Test"]);
-        yield* writeTextFile(sub, "pin.txt", "pin\n");
-        yield* git(sub, ["add", "."]);
+        const sub = yield* makeTmpDir("review-sub-head-");
+        yield* initRepoWithCommit(sub);
+        yield* writeTextFile(sub, "tracked.txt", "pin\n");
+        yield* git(sub, ["add", "tracked.txt"]);
         yield* git(sub, ["commit", "-m", "pin"]);
-        yield* git(sub, ["checkout", "-b", "release"]);
-        yield* writeTextFile(sub, "release.txt", "release\n");
-        yield* git(sub, ["add", "release.txt"]);
-        yield* git(sub, ["commit", "-m", "release"]);
-        yield* git(sub, ["checkout", "master"]);
-        yield* writeTextFile(sub, "master.txt", "master\n");
-        yield* git(sub, ["add", "master.txt"]);
-        yield* git(sub, ["commit", "-m", "master"]);
-        yield* git(sub, ["checkout", "-b", "feature", "release"]);
-        yield* writeTextFile(sub, "feature.txt", "feature\n");
-        yield* git(sub, ["add", "feature.txt"]);
-        yield* git(sub, ["commit", "-m", "feature"]);
-        yield* git(sub, ["checkout", "master"]);
-
-        const cwd = yield* makeTmpDir("review-super-base-");
+        const cwd = yield* makeTmpDir("review-super-head-");
         yield* initRepoWithCommit(cwd);
-        yield* git(cwd, ["submodule", "add", sub, "salesforce-project"], allowFile);
+        yield* git(cwd, ["submodule", "add", sub, "salesforce-project"], {
+          GIT_ALLOW_PROTOCOL: "file",
+        });
         yield* git(cwd, ["commit", "-m", "pin submodule"]);
         const project = pathService.join(cwd, "salesforce-project");
-        yield* git(project, ["checkout", "feature"]);
-        yield* git(project, [
-          "config",
-          "branch.feature.t3-merge-base-ref",
-          "refs/remotes/origin/release",
-        ]);
-        yield* writeTextFile(project, "feature.txt", "feature\ndirty\n");
-        yield* writeTextFile(project, "new.txt", "new\n");
+        yield* git(project, ["config", "user.email", "test@test.com"]);
+        yield* git(project, ["config", "user.name", "Test"]);
+        yield* writeTextFile(project, "tracked.txt", "pin\nbeyond\n");
+        yield* git(project, ["commit", "-am", "beyond pin"]);
+        yield* writeTextFile(project, "tracked.txt", "pin\nbeyond\ndirty\n");
+        yield* writeTextFile(project, "staged.txt", "staged\n");
+        yield* git(project, ["add", "staged.txt"]);
+        yield* writeTextFile(project, "untracked.txt", "untracked\n");
 
         const preview = yield* driver.getReviewDiffPreview({ cwd });
-        const source = (kind: "working-tree" | "branch-range") =>
-          preview.sources.find((entry) => entry.kind === kind)!;
-        const branch = source("branch-range");
-        const branchPaths = branch.files!.map((file) => file.path);
-        assert.include(branchPaths, "salesforce-project/feature.txt");
-        assert.include(branchPaths, "salesforce-project/new.txt");
-        assert.notInclude(branchPaths, "salesforce-project/master.txt");
-        assert.notInclude(branchPaths, "salesforce-project/release.txt");
-        assert.include(branch.diff, "+feature");
-        assert.include(branch.diff, "+dirty");
-        assert.include(branch.diff, "+new");
-        const work = source("working-tree");
-        assert.include(
-          work.files!.map((file) => file.path),
-          "salesforce-project/new.txt",
-        );
-        assert.notInclude(
-          work.files!.map((file) => file.path),
-          "salesforce-project/master.txt",
-        );
-        assert.include(work.diff, "+dirty");
-        assert.notInclude(work.diff, "+feature");
-        const contents = yield* driver.getReviewDiffFileContents(
-          makeReviewDiffFileContentsInput(cwd, {
-            oldPath: "salesforce-project/feature.txt",
-            newPath: "salesforce-project/feature.txt",
-          }),
-        );
-        assert.strictEqual(contents.oldContents, "feature\n");
-        assert.strictEqual(contents.newContents, "feature\ndirty\n");
-
-        yield* git(project, ["checkout", "--detach"]);
-        const detached = yield* driver.getReviewDiffPreview({ cwd });
-        const detachedChanges = detached.sources.find((source) => source.kind === "branch-range")!;
-        assert.include(
-          detachedChanges.files!.map((file) => file.path),
-          "salesforce-project/master.txt",
-        );
-        assert.include(detachedChanges.diff, "-master");
+        for (const kind of ["working-tree", "branch-range"] as const) {
+          const view = preview.sources.find((entry) => entry.kind === kind)!;
+          const paths = view.files!.map((file) => file.path);
+          assert.includeMembers(paths, [
+            "salesforce-project/tracked.txt",
+            "salesforce-project/staged.txt",
+            "salesforce-project/untracked.txt",
+          ]);
+          assert.include(view.diff, "+dirty");
+          assert.include(view.diff, "+staged");
+          assert.include(view.diff, "+untracked");
+          assert.notInclude(view.diff, "+beyond");
+        }
       }),
     );
   });
