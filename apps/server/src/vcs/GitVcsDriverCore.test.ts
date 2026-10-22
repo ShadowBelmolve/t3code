@@ -3206,6 +3206,15 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
         yield* writeTextFile(extra, "e.txt", "extra\ndirty\n");
         yield* writeTextFile(proj, "untracked.txt", "untracked\n");
         yield* writeTextFile(cwd, "root-new.txt", "root-new\n");
+        // A gitlink with no .gitmodules URL. `submodule foreach --recursive` exits 128 here.
+        const odd = yield* git(proj, ["rev-parse", "HEAD"]);
+        yield* git(proj, [
+          "update-index",
+          "--add",
+          "--cacheinfo",
+          `160000,${odd},.repos/alchemy-effect/submodules/distilled`,
+        ]);
+        yield* git(proj, ["rm", "README.md"]);
 
         const preview = yield* driver.getReviewDiffPreview({ cwd, baseRef: initialBranch });
         const source = (kind: "working-tree" | "branch-range") =>
@@ -3218,12 +3227,13 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
         const dirty = source("working-tree");
         const changes = source("branch-range");
 
-        for (const [kind, filePath, additions] of [
+        for (const [kind, filePath, additions, deletions = 0] of [
           ["working-tree", "README.md", 1],
           ["working-tree", "root-new.txt", 1],
           ["working-tree", "proj/a.txt", 2],
           ["working-tree", "proj/nested/b.txt", 2],
           ["working-tree", "proj/untracked.txt", 1],
+          ["working-tree", "proj/README.md", 0, 1],
           ["working-tree", "extra/e.txt", 1],
           ["branch-range", "proj/a.txt", 3],
           ["branch-range", "proj/nested/b.txt", 3],
@@ -3234,7 +3244,7 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
             path: filePath,
             previousPath: null,
             additions,
-            deletions: 0,
+            deletions,
           });
         }
         for (const kind of ["working-tree", "branch-range"] as const) {
@@ -3242,7 +3252,13 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
           assert.notInclude(paths, "proj");
           assert.notInclude(paths, "proj/nested");
           assert.notInclude(paths, "extra");
-          assert.isFalse(paths.some((filePath) => filePath.startsWith("vendor/")));
+          assert.isFalse(
+            paths.some(
+              (filePath) =>
+                filePath.startsWith("vendor/") ||
+                filePath.startsWith("proj/.repos/alchemy-effect/submodules/distilled"),
+            ),
+          );
         }
         assert.notInclude(dirty.diff, "Subproject commit");
         assert.include(changes.diff, "Subproject commit");

@@ -2983,26 +2983,55 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
     return stdout.trim();
   });
 
-  // Checked-out submodules only. Uninitialized entries stay a gitlink in the superproject diff.
+  // Checked-out gitlinks only. `submodule foreach --recursive` aborts the whole preview when a
+  // nested gitlink has no URL in .gitmodules, so walk the index instead and skip anything that
+  // is not its own work tree. A missing .gitmodules spawns nothing.
   const listInitializedSubmodulePaths = Effect.fn("GitVcsDriver.review.submodules")(function* (
     repoCwd: string,
   ) {
-    // A missing .gitmodules is the common case and must not spawn git. A stat failure falls
-    // through to foreach, which is empty when the repo has no submodules.
     const hasGitmodules = yield* fileSystem
       .exists(path.join(repoCwd, ".gitmodules"))
-      .pipe(Effect.orElseSucceed(() => true));
+      .pipe(Effect.orElseSucceed(() => false));
     if (!hasGitmodules) return [];
-    const result = yield* executeGit(
-      "GitVcsDriver.review.submodules",
-      repoCwd,
-      ["submodule", "foreach", "--quiet", "--recursive", "printf '%s\\n' \"$displaypath\""],
-      { maxOutputBytes: REVIEW_METADATA_MAX_OUTPUT_BYTES },
-    );
-    return result.stdout
-      .split("\n")
-      .filter((line) => line.length > 0)
-      .sort();
+    const found: string[] = [];
+    const pending: Array<{ readonly cwd: string; readonly prefix: string }> = [
+      { cwd: repoCwd, prefix: "" },
+    ];
+    while (pending.length > 0) {
+      const current = pending.pop()!;
+      const listed = yield* executeGit(
+        "GitVcsDriver.review.submodules",
+        current.cwd,
+        ["ls-files", "-z", "--stage"],
+        { allowNonZeroExit: true, maxOutputBytes: REVIEW_METADATA_MAX_OUTPUT_BYTES },
+      ).pipe(Effect.orElseSucceed(() => null));
+      if (listed === null || listed.exitCode !== 0) continue;
+      for (const record of splitNullSeparatedGitStdoutPaths(listed)) {
+        if (!record.startsWith("160000 ")) continue;
+        const tab = record.indexOf("\t");
+        if (tab < 0) continue;
+        const relative = record.slice(tab + 1);
+        if (relative.length === 0) continue;
+        const child = path.normalize(path.join(current.cwd, relative));
+        const display = current.prefix.length === 0 ? relative : `${current.prefix}/${relative}`;
+        const probe = yield* executeGit(
+          "GitVcsDriver.review.submodules",
+          child,
+          ["rev-parse", "--show-toplevel"],
+          { allowNonZeroExit: true },
+        ).pipe(Effect.orElseSucceed(() => null));
+        if (
+          probe === null ||
+          probe.exitCode !== 0 ||
+          path.normalize(probe.stdout.trim()) !== child
+        ) {
+          continue;
+        }
+        found.push(display);
+        pending.push({ cwd: child, prefix: display });
+      }
+    }
+    return found.sort();
   });
 
   // submodulePaths is sorted, so each ancestor is visited before its children.
@@ -3320,22 +3349,35 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       if (superRef === null) return null;
       return (yield* reviewGitlink(cwd, superRef, submodulePath, submodulePaths)) ?? emptyTree;
     });
+    const skippedSlice = {
+      stdout: "",
+      stdoutTruncated: false,
+      files: [] as ReadonlyArray<ReviewDiffFileStat>,
+    };
+    const readSubmoduleOrSkip = Effect.fn("GitVcsDriver.review.submoduleDiff")(function* (
+      submodulePath: string,
+      emptyTree: string,
+      file?: { readonly path: string; readonly previousPath: string | null },
+    ) {
+      return yield* readRepositoryDiffs(repositorySpec(submodulePath, file), {
+        dirty: yield* submoduleBaseline(dirtyRef, submodulePath, emptyTree),
+        base: yield* submoduleBaseline(review.mergeBase, submodulePath, emptyTree),
+      }).pipe(
+        Effect.catchTags({
+          GitCommandError: () => Effect.succeed({ dirty: skippedSlice, base: skippedSlice }),
+        }),
+      );
+    });
     const { dirty: dirtyTrackedResult, base: baseResult } = yield* Effect.gen(function* () {
       if (requested !== null && input.file) {
         const previous = input.file.previousPath
           ? matchInitializedSubmodule([requested.submodulePath], input.file.previousPath)
           : null;
         const emptyTree = yield* readEmptyTreeHash(cwd);
-        return yield* readRepositoryDiffs(
-          repositorySpec(requested.submodulePath, {
-            path: requested.relativePath,
-            previousPath: previous?.relativePath ?? null,
-          }),
-          {
-            dirty: yield* submoduleBaseline(dirtyRef, requested.submodulePath, emptyTree),
-            base: yield* submoduleBaseline(review.mergeBase, requested.submodulePath, emptyTree),
-          },
-        );
+        return yield* readSubmoduleOrSkip(requested.submodulePath, emptyTree, {
+          path: requested.relativePath,
+          previousPath: previous?.relativePath ?? null,
+        });
       }
       const root = yield* readRepositoryDiffs(repositorySpec("", input.file), {
         dirty: dirtyRef,
@@ -3346,10 +3388,7 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       const dirtyParts: ReviewDiffSlice[] = [root.dirty];
       const baseParts: ReviewDiffSlice[] = [root.base];
       for (const submodulePath of submodulePaths) {
-        const part = yield* readRepositoryDiffs(repositorySpec(submodulePath), {
-          dirty: yield* submoduleBaseline(dirtyRef, submodulePath, emptyTree),
-          base: yield* submoduleBaseline(review.mergeBase, submodulePath, emptyTree),
-        });
+        const part = yield* readSubmoduleOrSkip(submodulePath, emptyTree);
         dirtyParts.push(part.dirty);
         baseParts.push(part.base);
       }
