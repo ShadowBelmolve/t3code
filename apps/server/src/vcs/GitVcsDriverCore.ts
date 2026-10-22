@@ -219,12 +219,10 @@ type ReviewDiffSlice = {
 };
 
 function prefixReviewDiffStat(file: ReviewDiffFileStat, prefix: string): ReviewDiffFileStat {
-  if (prefix.length === 0) return file;
   return {
-    path: `${prefix}${file.path}`,
-    previousPath: file.previousPath === null ? null : `${prefix}${file.previousPath}`,
-    additions: file.additions,
-    deletions: file.deletions,
+    ...file,
+    path: prefix + file.path,
+    previousPath: file.previousPath === null ? null : prefix + file.previousPath,
   };
 }
 
@@ -244,51 +242,22 @@ function matchInitializedSubmodule(
 ): { readonly submodulePath: string; readonly relativePath: string } | null {
   let submodulePath: string | null = null;
   for (const candidate of submodulePaths) {
-    if (filePath !== candidate && !filePath.startsWith(`${candidate}/`)) continue;
+    if (!filePath.startsWith(`${candidate}/`)) continue;
     if (submodulePath === null || candidate.length > submodulePath.length)
       submodulePath = candidate;
   }
   if (submodulePath === null) return null;
-  return {
-    submodulePath,
-    relativePath: filePath === submodulePath ? "" : filePath.slice(submodulePath.length + 1),
-  };
-}
-
-function parentSubmodulePath(
-  submodulePaths: readonly string[],
-  submodulePath: string,
-): string | null {
-  let parent: string | null = null;
-  for (const candidate of submodulePaths) {
-    if (candidate === submodulePath || !submodulePath.startsWith(`${candidate}/`)) continue;
-    if (parent === null || candidate.length > parent.length) parent = candidate;
-  }
-  return parent;
-}
-
-function relativeSubmodulePath(submodulePath: string, filePath: string): string | null {
-  if (filePath === submodulePath) return "";
-  const prefix = `${submodulePath}/`;
-  return filePath.startsWith(prefix) ? filePath.slice(prefix.length) : null;
+  return { submodulePath, relativePath: filePath.slice(submodulePath.length + 1) };
 }
 
 function directSubmoduleExcludeArgs(
   submodulePaths: readonly string[],
   parentPath: string,
 ): string[] {
-  const args: string[] = [];
-  for (const candidate of submodulePaths) {
-    const relative =
-      parentPath.length === 0
-        ? candidate
-        : candidate.startsWith(`${parentPath}/`)
-          ? candidate.slice(parentPath.length + 1)
-          : null;
-    if (relative === null || relative.length === 0 || relative.includes("/")) continue;
-    args.push(`:(exclude,literal,top)${relative}`);
-  }
-  return args;
+  const prefix = parentPath ? `${parentPath}/` : "";
+  return submodulePaths
+    .filter((candidate) => candidate.startsWith(prefix) && candidate !== parentPath)
+    .map((candidate) => `:(exclude,literal,top)${candidate.slice(prefix.length)}`);
 }
 
 function parseGitlinkCommit(stdout: string): string | null {
@@ -296,34 +265,18 @@ function parseGitlinkCommit(stdout: string): string | null {
   return match?.[1] ?? null;
 }
 
-function resolveRepoPath(pathService: Path.Path, root: string, gitPath: string): string {
-  return gitPath
-    .split("/")
-    .reduce((directory, segment) => pathService.join(directory, segment), root);
-}
-
 function mergeReviewDiffSlices(
   parts: readonly ReviewDiffSlice[],
   patchLimit: number,
 ): ReviewDiffSlice {
-  let stdout = "";
-  let stdoutTruncated = false;
-  const files: ReviewDiffFileStat[] = [];
-  let filesIncomplete = false;
-  for (const part of parts) {
-    if (part.files === undefined) filesIncomplete = true;
-    else if (!filesIncomplete) files.push(...part.files);
-    if (stdoutTruncated) continue;
-    const room = patchLimit - stdout.length;
-    if (part.stdout.length > room) {
-      stdout += part.stdout.slice(0, Math.max(0, room));
-      stdoutTruncated = true;
-      continue;
-    }
-    stdout += part.stdout;
-    if (part.stdoutTruncated) stdoutTruncated = true;
-  }
-  return { stdout, stdoutTruncated, files: filesIncomplete ? undefined : files };
+  const end = parts.findIndex((part) => part.stdoutTruncated);
+  const used = end < 0 ? parts : parts.slice(0, end + 1);
+  const joined = used.map((part) => part.stdout).join("");
+  return {
+    stdout: joined.slice(0, patchLimit),
+    stdoutTruncated: end >= 0 || joined.length > patchLimit,
+    files: parts.every((part) => part.files) ? parts.flatMap((part) => part.files!) : undefined,
+  };
 }
 
 // Space-separated fields precede the path in each porcelain v2 record type. The path itself
@@ -3034,18 +2987,11 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
   const listInitializedSubmodulePaths = Effect.fn("GitVcsDriver.review.submodules")(function* (
     repoCwd: string,
   ) {
-    const hasGitmodules = yield* fileSystem.exists(path.join(repoCwd, ".gitmodules")).pipe(
-      Effect.mapError(
-        (cause) =>
-          new GitCommandError({
-            operation: "GitVcsDriver.review.submodules",
-            command: "fs.exists",
-            cwd: repoCwd,
-            detail: "Could not inspect .gitmodules.",
-            cause,
-          }),
-      ),
-    );
+    // A missing .gitmodules is the common case and must not spawn git. A stat failure falls
+    // through to foreach, which is empty when the repo has no submodules.
+    const hasGitmodules = yield* fileSystem
+      .exists(path.join(repoCwd, ".gitmodules"))
+      .pipe(Effect.orElseSucceed(() => true));
     if (!hasGitmodules) return [];
     const result = yield* executeGit(
       "GitVcsDriver.review.submodules",
@@ -3056,52 +3002,38 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
     return result.stdout
       .split("\n")
       .filter((line) => line.length > 0)
-      .sort((left, right) => (left < right ? -1 : left > right ? 1 : 0));
+      .sort();
   });
 
-  // The commit the superproject records for this submodule at `superRef`, walking nested gitlinks.
+  // submodulePaths is sorted, so each ancestor is visited before its children.
   // Null when that submodule is not in the tree yet.
   const reviewGitlink = Effect.fn("GitVcsDriver.review.gitlink")(function* (
     repoRoot: string,
     superRef: string,
-    submodulePath: string,
+    target: string,
     submodulePaths: readonly string[],
-    cache: Map<string, string | null>,
   ) {
-    const chain: string[] = [];
-    let cursor: string | null = submodulePath;
-    while (cursor !== null) {
-      chain.push(cursor);
-      cursor = parentSubmodulePath(submodulePaths, cursor);
-    }
-    let sha: string | null = null;
-    for (const entry of chain.toReversed()) {
-      const key = `${superRef}\0${entry}`;
-      const cached = cache.get(key);
-      if (cached !== undefined) {
-        sha = cached;
-        continue;
-      }
-      const parent = parentSubmodulePath(submodulePaths, entry);
-      if (parent !== null && sha === null) {
-        cache.set(key, null);
-        continue;
-      }
-      const listed = yield* executeGit(
+    let sha: string | null = superRef;
+    let parent = "";
+    for (const entry of submodulePaths) {
+      if (entry !== target && !target.startsWith(`${entry}/`)) continue;
+      const revision = sha;
+      if (revision === null) return null;
+      const listed: GitVcsDriver.ExecuteGitResult = yield* executeGit(
         "GitVcsDriver.review.gitlink",
-        parent === null ? repoRoot : resolveRepoPath(path, repoRoot, parent),
+        path.join(repoRoot, parent),
         [
           "ls-tree",
           "-z",
           "--end-of-options",
-          parent === null ? superRef : sha!,
+          revision,
           "--",
-          parent === null ? entry : entry.slice(parent.length + 1),
+          parent ? entry.slice(parent.length + 1) : entry,
         ],
         { allowNonZeroExit: true },
       );
       sha = listed.exitCode === 0 ? parseGitlinkCommit(listed.stdout) : null;
-      cache.set(key, sha);
+      parent = entry;
     }
     return sha;
   });
@@ -3274,61 +3206,64 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
     const requested = input.file
       ? matchInitializedSubmodule(submodulePaths, input.file.path)
       : null;
-    const gitlinks = new Map<string, string | null>();
     const readStats = Effect.fn("GitVcsDriver.getReviewDiffPreview.stat")(function* (
-      repoCwd: string,
+      repo: {
+        readonly repoCwd: string;
+        readonly diffPathArgs: ReadonlyArray<string>;
+        readonly statPrefix: string;
+        readonly prefixArgs: ReadonlyArray<string>;
+      },
       ref: string,
       env: NodeJS.ProcessEnv | undefined,
-      diffPathArgs: ReadonlyArray<string>,
-      statPrefix: string,
-      prefixArgs: ReadonlyArray<string>,
     ) {
-      const args = [...diffArgs, ...prefixArgs, "--numstat", "-z"];
+      const args = [...diffArgs, ...repo.prefixArgs, "--numstat", "-z"];
       const result = yield* executeGit(
         "GitVcsDriver.getReviewDiffPreview.stat",
-        repoCwd,
-        [...args, ref, "--", ...diffPathArgs],
+        repo.repoCwd,
+        [...args, ref, "--", ...repo.diffPathArgs],
         { allowNonZeroExit: true, maxOutputBytes: REVIEW_METADATA_MAX_OUTPUT_BYTES, env },
       );
       const filesFrom = (stdout: string) =>
-        parseReviewNumstat(stdout).map((file) => prefixReviewDiffStat(file, statPrefix));
+        parseReviewNumstat(stdout).map((file) => prefixReviewDiffStat(file, repo.statPrefix));
       if (result.exitCode === 0) return { ref, files: filesFrom(result.stdout) };
       if (ref === "HEAD" && isUnbornHeadStderr(result.stderr)) {
-        const emptyTree = yield* readEmptyTreeHash(repoCwd);
+        const emptyTree = yield* readEmptyTreeHash(repo.repoCwd);
         const stdout = yield* runGitStdoutWithOptions(
           "GitVcsDriver.getReviewDiffPreview.unbornStat",
-          repoCwd,
-          [...args, emptyTree, "--", ...diffPathArgs],
+          repo.repoCwd,
+          [...args, emptyTree, "--", ...repo.diffPathArgs],
           { maxOutputBytes: REVIEW_METADATA_MAX_OUTPUT_BYTES, env },
         );
         return { ref: emptyTree, files: filesFrom(stdout) };
       }
       return yield* new GitCommandError({
         operation: "GitVcsDriver.getReviewDiffPreview.stat",
-        cwd: repoCwd,
+        cwd: repo.repoCwd,
         command: "git diff --numstat",
         detail: "Could not read complete diff statistics.",
         exitCode: result.exitCode,
       });
     });
     const readTrackedDiff = Effect.fn("GitVcsDriver.getReviewDiffPreview.tracked")(function* (
-      repoCwd: string,
+      repo: {
+        readonly repoCwd: string;
+        readonly diffPathArgs: ReadonlyArray<string>;
+        readonly statPrefix: string;
+        readonly prefixArgs: ReadonlyArray<string>;
+      },
       ref: string | null,
       env: NodeJS.ProcessEnv | undefined,
-      diffPathArgs: ReadonlyArray<string>,
-      statPrefix: string,
-      prefixArgs: ReadonlyArray<string>,
     ) {
       if (ref === null) return { stdout: "", stdoutTruncated: false, files: [] };
-      const stat = yield* readStats(repoCwd, ref, env, diffPathArgs, statPrefix, prefixArgs);
-      if (stat.files.length === 0) return { stdout: "", stdoutTruncated: false, files: stat.files };
+      const stat = yield* readStats(repo, ref, env);
+      if (stat.files.length === 0) return { stdout: "", stdoutTruncated: false, files: [] };
       const patch = yield* executeGit(
         "GitVcsDriver.getReviewDiffPreview.patch",
-        repoCwd,
-        [...diffArgs, ...prefixArgs, "--patch", stat.ref, "--", ...diffPathArgs],
+        repo.repoCwd,
+        [...diffArgs, ...repo.prefixArgs, "--patch", stat.ref, "--", ...repo.diffPathArgs],
         { maxOutputBytes: patchLimit, appendTruncationMarker: true, env },
       );
-      const stdout = prefixSubmodulePatch(patch.stdout, statPrefix);
+      const stdout = prefixSubmodulePatch(patch.stdout, repo.statPrefix);
       return {
         stdout: stdout.length > patchLimit ? stdout.slice(0, patchLimit) : stdout,
         stdoutTruncated: patch.stdoutTruncated || stdout.length > patchLimit,
@@ -3352,19 +3287,18 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
           repo.listPathArgs,
           repo.onlyPath,
         );
-        const read = (ref: string | null) =>
-          readTrackedDiff(
-            repo.repoCwd,
-            ref,
-            untracked?.env,
-            repo.diffPathArgs,
-            repo.statPrefix,
-            repo.prefixArgs,
-          );
         const [dirty, base] =
           refs.dirty !== null && refs.dirty === refs.base
-            ? yield* read(refs.dirty).pipe(Effect.map((result) => [result, result] as const))
-            : yield* Effect.all([read(refs.dirty), read(refs.base)], { concurrency: 2 });
+            ? yield* readTrackedDiff(repo, refs.dirty, untracked?.env).pipe(
+                Effect.map((result) => [result, result] as const),
+              )
+            : yield* Effect.all(
+                [
+                  readTrackedDiff(repo, refs.dirty, untracked?.env),
+                  readTrackedDiff(repo, refs.base, untracked?.env),
+                ],
+                { concurrency: 2 },
+              );
         if (untracked !== null) return { dirty, base };
         const incomplete = (ref: string | null, result: typeof dirty): ReviewDiffSlice =>
           ref === null ? result : { ...result, files: undefined, stdoutTruncated: true };
@@ -3377,20 +3311,16 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
     ) => {
       const statPrefix = parentPath.length === 0 ? "" : `${parentPath}/`;
       const paths =
-        file === undefined
-          ? []
-          : [file.path, ...(file.previousPath ? [file.previousPath] : [])].filter(
-              (entry) => entry.length > 0,
-            );
+        file === undefined ? [] : [file.path, ...(file.previousPath ? [file.previousPath] : [])];
       const listPathArgs = paths.map((entry) => `:(top,literal)${entry}`);
       return {
-        repoCwd: parentPath.length === 0 ? cwd : resolveRepoPath(path, cwd, parentPath),
+        repoCwd: parentPath.length === 0 ? cwd : path.join(cwd, parentPath),
         diffPathArgs:
           file === undefined
             ? directSubmoduleExcludeArgs(submodulePaths, parentPath)
             : listPathArgs,
         listPathArgs,
-        onlyPath: file?.path.length ? file.path : undefined,
+        onlyPath: file?.path,
         statPrefix,
         prefixArgs:
           parentPath.length === 0
@@ -3404,25 +3334,24 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       emptyTree: string,
     ) {
       if (superRef === null) return null;
-      return (
-        (yield* reviewGitlink(cwd, superRef, submodulePath, submodulePaths, gitlinks)) ?? emptyTree
-      );
+      return (yield* reviewGitlink(cwd, superRef, submodulePath, submodulePaths)) ?? emptyTree;
     });
     const { dirty: dirtyTrackedResult, base: baseResult } = yield* Effect.gen(function* () {
       if (requested !== null && input.file) {
-        const relativePrevious =
-          input.file.previousPath === null
-            ? null
-            : relativeSubmodulePath(requested.submodulePath, input.file.previousPath);
-        const file =
-          requested.relativePath.length === 0
-            ? undefined
-            : { path: requested.relativePath, previousPath: relativePrevious };
+        const previous = input.file.previousPath
+          ? matchInitializedSubmodule([requested.submodulePath], input.file.previousPath)
+          : null;
         const emptyTree = yield* readEmptyTreeHash(cwd);
-        return yield* readRepositoryDiffs(repositorySpec(requested.submodulePath, file), {
-          dirty: yield* submoduleBaseline(dirtyRef, requested.submodulePath, emptyTree),
-          base: yield* submoduleBaseline(review.mergeBase, requested.submodulePath, emptyTree),
-        });
+        return yield* readRepositoryDiffs(
+          repositorySpec(requested.submodulePath, {
+            path: requested.relativePath,
+            previousPath: previous?.relativePath ?? null,
+          }),
+          {
+            dirty: yield* submoduleBaseline(dirtyRef, requested.submodulePath, emptyTree),
+            base: yield* submoduleBaseline(review.mergeBase, requested.submodulePath, emptyTree),
+          },
+        );
       }
       const root = yield* readRepositoryDiffs(
         repositorySpec(
@@ -3622,41 +3551,30 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
         ? (input.baseRef ?? "HEAD")
         : (yield* resolveReviewMergeBase(input.cwd, null, input.baseRef ?? undefined)).mergeBase;
     const submodulePaths =
-      input.oldPath.includes("/") || input.newPath.includes("/")
-        ? yield* listInitializedSubmodulePaths(repositoryRoot)
-        : [];
-    const oldMatch =
-      input.changeType === "new" ? null : matchInitializedSubmodule(submodulePaths, input.oldPath);
-    const gitlinks = new Map<string, string | null>();
+      input.changeType === "new" || !input.oldPath.includes("/")
+        ? []
+        : yield* listInitializedSubmodulePaths(repositoryRoot);
+    const oldMatch = matchInitializedSubmodule(submodulePaths, input.oldPath);
     const [oldContents, newContents] = yield* Effect.all(
       [
         input.changeType === "new"
           ? Effect.succeed("")
-          : oldMatch !== null && oldMatch.relativePath.length > 0
-            ? Effect.gen(function* () {
+          : oldMatch === null
+            ? readReviewFileAtRevision(input, oldRevision, input.oldPath)
+            : Effect.gen(function* () {
                 const sha = yield* reviewGitlink(
                   repositoryRoot,
                   oldRevision,
                   oldMatch.submodulePath,
                   submodulePaths,
-                  gitlinks,
                 );
                 if (sha === null) return "";
-                const result = yield* executeGit(
-                  "GitVcsDriver.getReviewDiffFileContents.revision",
-                  resolveRepoPath(path, repositoryRoot, oldMatch.submodulePath),
-                  ["show", "--end-of-options", `${sha}:${oldMatch.relativePath}`],
-                  { maxOutputBytes: REVIEW_DIFF_FILE_MAX_OUTPUT_BYTES },
+                return yield* readReviewFileAtRevision(
+                  { ...input, cwd: path.join(repositoryRoot, oldMatch.submodulePath) },
+                  sha,
+                  oldMatch.relativePath,
                 );
-                if (result.stdout.includes("\0")) {
-                  return yield* reviewDiffFileError(
-                    input,
-                    `Cannot expand binary file '${input.oldPath}'.`,
-                  );
-                }
-                return result.stdout;
-              })
-            : readReviewFileAtRevision(input, oldRevision, input.oldPath),
+              }),
         input.changeType === "deleted"
           ? Effect.succeed("")
           : readWorkingTreeReviewFile(input, repositoryRoot),

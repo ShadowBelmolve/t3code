@@ -3145,28 +3145,23 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
             ],
             { discard: true },
           );
+        const makeRepo = (prefix: string, file: string, contents: string) =>
+          Effect.gen(function* () {
+            const repo = yield* makeTmpDir(prefix);
+            yield* initRepoWithCommit(repo);
+            yield* writeTextFile(repo, file, contents);
+            yield* git(repo, ["add", "."]);
+            yield* git(repo, ["commit", "-m", file]);
+            return repo;
+          });
 
-        const nestedRepo = yield* makeTmpDir("review-nested-");
-        yield* initRepoWithCommit(nestedRepo);
-        yield* writeTextFile(nestedRepo, "b.txt", "nested-base\n");
-        yield* git(nestedRepo, ["add", "."]);
-        yield* git(nestedRepo, ["commit", "-m", "nested"]);
-        const projRepo = yield* makeTmpDir("review-proj-");
-        yield* initRepoWithCommit(projRepo);
-        yield* writeTextFile(projRepo, "a.txt", "a-base\n");
+        const nestedRepo = yield* makeRepo("review-nested-", "b.txt", "nested-base\n");
+        const projRepo = yield* makeRepo("review-proj-", "a.txt", "a-base\n");
         yield* git(projRepo, ["submodule", "add", nestedRepo, "nested"], allowFile);
         yield* git(projRepo, ["add", "."]);
         yield* git(projRepo, ["commit", "-m", "proj"]);
-        const vendorRepo = yield* makeTmpDir("review-vendor-");
-        yield* initRepoWithCommit(vendorRepo);
-        yield* writeTextFile(vendorRepo, "v.txt", "vendor\n");
-        yield* git(vendorRepo, ["add", "."]);
-        yield* git(vendorRepo, ["commit", "-m", "vendor"]);
-        const extraRepo = yield* makeTmpDir("review-extra-");
-        yield* initRepoWithCommit(extraRepo);
-        yield* writeTextFile(extraRepo, "e.txt", "extra\n");
-        yield* git(extraRepo, ["add", "."]);
-        yield* git(extraRepo, ["commit", "-m", "extra"]);
+        const vendorRepo = yield* makeRepo("review-vendor-", "v.txt", "vendor\n");
+        const extraRepo = yield* makeRepo("review-extra-", "e.txt", "extra\n");
 
         const cwd = yield* makeTmpDir("review-super-");
         const { initialBranch } = yield* initRepoWithCommit(cwd);
@@ -3181,6 +3176,11 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
         yield* configure(nested);
 
         yield* git(cwd, ["checkout", "-b", "feature/sub"]);
+        yield* writeTextFile(vendorRepo, "v.txt", "vendor-next\n");
+        yield* git(vendorRepo, ["commit", "-am", "vendor next"]);
+        const vendorNext = yield* git(vendorRepo, ["rev-parse", "HEAD"]);
+        yield* git(cwd, ["update-index", "--cacheinfo", `160000,${vendorNext},vendor`]);
+        yield* git(cwd, ["commit", "-m", "bump uninitialized vendor"]);
         yield* writeTextFile(cwd, "README.md", "# test\nfeature\n");
         yield* git(cwd, ["commit", "-am", "root feature"]);
         yield* writeTextFile(nested, "b.txt", "nested-base\nfeature\n");
@@ -3218,75 +3218,35 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
         const dirty = source("working-tree");
         const changes = source("branch-range");
 
-        assert.deepStrictEqual(stat("working-tree", "README.md"), {
-          path: "README.md",
-          previousPath: null,
-          additions: 1,
-          deletions: 0,
-        });
-        assert.deepStrictEqual(stat("working-tree", "root-new.txt"), {
-          path: "root-new.txt",
-          previousPath: null,
-          additions: 1,
-          deletions: 0,
-        });
-        assert.deepStrictEqual(stat("working-tree", "proj/a.txt"), {
-          path: "proj/a.txt",
-          previousPath: null,
-          additions: 2,
-          deletions: 0,
-        });
-        assert.deepStrictEqual(stat("working-tree", "proj/nested/b.txt"), {
-          path: "proj/nested/b.txt",
-          previousPath: null,
-          additions: 2,
-          deletions: 0,
-        });
-        assert.deepStrictEqual(stat("working-tree", "proj/untracked.txt"), {
-          path: "proj/untracked.txt",
-          previousPath: null,
-          additions: 1,
-          deletions: 0,
-        });
-        assert.deepStrictEqual(stat("working-tree", "extra/e.txt"), {
-          path: "extra/e.txt",
-          previousPath: null,
-          additions: 1,
-          deletions: 0,
-        });
-        assert.deepStrictEqual(stat("branch-range", "proj/a.txt"), {
-          path: "proj/a.txt",
-          previousPath: null,
-          additions: 3,
-          deletions: 0,
-        });
-        assert.deepStrictEqual(stat("branch-range", "proj/nested/b.txt"), {
-          path: "proj/nested/b.txt",
-          previousPath: null,
-          additions: 3,
-          deletions: 0,
-        });
-        assert.deepStrictEqual(stat("branch-range", "extra/e.txt"), {
-          path: "extra/e.txt",
-          previousPath: null,
-          additions: 2,
-          deletions: 0,
-        });
-        assert.deepStrictEqual(stat("branch-range", "extra/README.md"), {
-          path: "extra/README.md",
-          previousPath: null,
-          additions: 1,
-          deletions: 0,
-        });
+        for (const [kind, filePath, additions] of [
+          ["working-tree", "README.md", 1],
+          ["working-tree", "root-new.txt", 1],
+          ["working-tree", "proj/a.txt", 2],
+          ["working-tree", "proj/nested/b.txt", 2],
+          ["working-tree", "proj/untracked.txt", 1],
+          ["working-tree", "extra/e.txt", 1],
+          ["branch-range", "proj/a.txt", 3],
+          ["branch-range", "proj/nested/b.txt", 3],
+          ["branch-range", "extra/e.txt", 2],
+          ["branch-range", "extra/README.md", 1],
+        ] as const) {
+          assert.deepStrictEqual(stat(kind, filePath), {
+            path: filePath,
+            previousPath: null,
+            additions,
+            deletions: 0,
+          });
+        }
         for (const kind of ["working-tree", "branch-range"] as const) {
           const paths = source(kind).files!.map((file) => file.path);
           assert.notInclude(paths, "proj");
           assert.notInclude(paths, "proj/nested");
           assert.notInclude(paths, "extra");
-          assert.notInclude(paths, "vendor");
           assert.isFalse(paths.some((filePath) => filePath.startsWith("vendor/")));
-          assert.notInclude(source(kind).diff, "Subproject commit");
         }
+        assert.notInclude(dirty.diff, "Subproject commit");
+        assert.include(changes.diff, "Subproject commit");
+        assert.notInclude(changes.diff, "vendor-next");
         assert.include(dirty.diff, "diff --git a/proj/a.txt b/proj/a.txt");
         assert.include(dirty.diff, "diff --git a/proj/nested/b.txt b/proj/nested/b.txt");
         assert.include(dirty.diff, "diff --git a/proj/untracked.txt b/proj/untracked.txt");
