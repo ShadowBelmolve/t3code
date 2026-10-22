@@ -3131,6 +3131,238 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
         }
       }),
     );
+
+    it.effect("flattens nested submodule changes onto the superproject", () =>
+      Effect.gen(function* () {
+        const allowFile = { GIT_ALLOW_PROTOCOL: "file" };
+        const pathService = yield* Path.Path;
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+        const configure = (repo: string) =>
+          Effect.all(
+            [
+              git(repo, ["config", "user.email", "test@test.com"]),
+              git(repo, ["config", "user.name", "Test"]),
+            ],
+            { discard: true },
+          );
+
+        const nestedRepo = yield* makeTmpDir("review-nested-");
+        yield* initRepoWithCommit(nestedRepo);
+        yield* writeTextFile(nestedRepo, "b.txt", "nested-base\n");
+        yield* git(nestedRepo, ["add", "."]);
+        yield* git(nestedRepo, ["commit", "-m", "nested"]);
+        const projRepo = yield* makeTmpDir("review-proj-");
+        yield* initRepoWithCommit(projRepo);
+        yield* writeTextFile(projRepo, "a.txt", "a-base\n");
+        yield* git(projRepo, ["submodule", "add", nestedRepo, "nested"], allowFile);
+        yield* git(projRepo, ["add", "."]);
+        yield* git(projRepo, ["commit", "-m", "proj"]);
+        const vendorRepo = yield* makeTmpDir("review-vendor-");
+        yield* initRepoWithCommit(vendorRepo);
+        yield* writeTextFile(vendorRepo, "v.txt", "vendor\n");
+        yield* git(vendorRepo, ["add", "."]);
+        yield* git(vendorRepo, ["commit", "-m", "vendor"]);
+        const extraRepo = yield* makeTmpDir("review-extra-");
+        yield* initRepoWithCommit(extraRepo);
+        yield* writeTextFile(extraRepo, "e.txt", "extra\n");
+        yield* git(extraRepo, ["add", "."]);
+        yield* git(extraRepo, ["commit", "-m", "extra"]);
+
+        const cwd = yield* makeTmpDir("review-super-");
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        yield* git(cwd, ["submodule", "add", projRepo, "proj"], allowFile);
+        yield* git(cwd, ["submodule", "add", vendorRepo, "vendor"], allowFile);
+        yield* git(cwd, ["commit", "-m", "add submodules"]);
+        yield* git(cwd, ["submodule", "update", "--init", "--recursive"], allowFile);
+        yield* git(cwd, ["submodule", "deinit", "-f", "vendor"]);
+        const proj = pathService.join(cwd, "proj");
+        const nested = pathService.join(proj, "nested");
+        yield* configure(proj);
+        yield* configure(nested);
+
+        yield* git(cwd, ["checkout", "-b", "feature/sub"]);
+        yield* writeTextFile(cwd, "README.md", "# test\nfeature\n");
+        yield* git(cwd, ["commit", "-am", "root feature"]);
+        yield* writeTextFile(nested, "b.txt", "nested-base\nfeature\n");
+        yield* git(nested, ["commit", "-am", "nested feature"]);
+        yield* writeTextFile(proj, "a.txt", "a-base\nfeature\n");
+        yield* git(proj, ["add", "a.txt", "nested"]);
+        yield* git(proj, ["commit", "-m", "proj feature"]);
+        yield* git(cwd, ["add", "proj"]);
+        yield* git(cwd, ["commit", "-m", "record proj"]);
+        yield* git(cwd, ["submodule", "add", extraRepo, "extra"], allowFile);
+        yield* git(cwd, ["commit", "-m", "add extra"]);
+        const extra = pathService.join(cwd, "extra");
+        yield* configure(extra);
+
+        // Commits inside the submodules that the superproject has not recorded.
+        yield* writeTextFile(proj, "a.txt", "a-base\nfeature\nrecorded\n");
+        yield* git(proj, ["commit", "-am", "proj only"]);
+        yield* writeTextFile(nested, "b.txt", "nested-base\nfeature\nunrecorded\n");
+        yield* git(nested, ["commit", "-am", "nested only"]);
+        yield* writeTextFile(cwd, "README.md", "# test\nfeature\ndirty\n");
+        yield* writeTextFile(proj, "a.txt", "a-base\nfeature\nrecorded\ndirty\n");
+        yield* writeTextFile(nested, "b.txt", "nested-base\nfeature\nunrecorded\ndirty\n");
+        yield* writeTextFile(extra, "e.txt", "extra\ndirty\n");
+        yield* writeTextFile(proj, "untracked.txt", "untracked\n");
+        yield* writeTextFile(cwd, "root-new.txt", "root-new\n");
+
+        const preview = yield* driver.getReviewDiffPreview({ cwd, baseRef: initialBranch });
+        const source = (kind: "working-tree" | "branch-range") =>
+          preview.sources.find((entry) => entry.kind === kind)!;
+        const stat = (kind: "working-tree" | "branch-range", filePath: string) => {
+          const file = source(kind).files!.find((entry) => entry.path === filePath);
+          if (file === undefined) return assert.fail(`missing ${filePath}`);
+          return file;
+        };
+        const dirty = source("working-tree");
+        const changes = source("branch-range");
+
+        assert.deepStrictEqual(stat("working-tree", "README.md"), {
+          path: "README.md",
+          previousPath: null,
+          additions: 1,
+          deletions: 0,
+        });
+        assert.deepStrictEqual(stat("working-tree", "root-new.txt"), {
+          path: "root-new.txt",
+          previousPath: null,
+          additions: 1,
+          deletions: 0,
+        });
+        assert.deepStrictEqual(stat("working-tree", "proj/a.txt"), {
+          path: "proj/a.txt",
+          previousPath: null,
+          additions: 2,
+          deletions: 0,
+        });
+        assert.deepStrictEqual(stat("working-tree", "proj/nested/b.txt"), {
+          path: "proj/nested/b.txt",
+          previousPath: null,
+          additions: 2,
+          deletions: 0,
+        });
+        assert.deepStrictEqual(stat("working-tree", "proj/untracked.txt"), {
+          path: "proj/untracked.txt",
+          previousPath: null,
+          additions: 1,
+          deletions: 0,
+        });
+        assert.deepStrictEqual(stat("working-tree", "extra/e.txt"), {
+          path: "extra/e.txt",
+          previousPath: null,
+          additions: 1,
+          deletions: 0,
+        });
+        assert.deepStrictEqual(stat("branch-range", "proj/a.txt"), {
+          path: "proj/a.txt",
+          previousPath: null,
+          additions: 3,
+          deletions: 0,
+        });
+        assert.deepStrictEqual(stat("branch-range", "proj/nested/b.txt"), {
+          path: "proj/nested/b.txt",
+          previousPath: null,
+          additions: 3,
+          deletions: 0,
+        });
+        assert.deepStrictEqual(stat("branch-range", "extra/e.txt"), {
+          path: "extra/e.txt",
+          previousPath: null,
+          additions: 2,
+          deletions: 0,
+        });
+        assert.deepStrictEqual(stat("branch-range", "extra/README.md"), {
+          path: "extra/README.md",
+          previousPath: null,
+          additions: 1,
+          deletions: 0,
+        });
+        for (const kind of ["working-tree", "branch-range"] as const) {
+          const paths = source(kind).files!.map((file) => file.path);
+          assert.notInclude(paths, "proj");
+          assert.notInclude(paths, "proj/nested");
+          assert.notInclude(paths, "extra");
+          assert.notInclude(paths, "vendor");
+          assert.isFalse(paths.some((filePath) => filePath.startsWith("vendor/")));
+          assert.notInclude(source(kind).diff, "Subproject commit");
+        }
+        assert.include(dirty.diff, "diff --git a/proj/a.txt b/proj/a.txt");
+        assert.include(dirty.diff, "diff --git a/proj/nested/b.txt b/proj/nested/b.txt");
+        assert.include(dirty.diff, "diff --git a/proj/untracked.txt b/proj/untracked.txt");
+        assert.include(dirty.diff, "+recorded");
+        assert.include(dirty.diff, "+unrecorded");
+        assert.notInclude(dirty.diff, "+feature");
+        assert.include(changes.diff, "+feature");
+        assert.include(changes.diff, "diff --git a/extra/e.txt b/extra/e.txt");
+        assert.include(changes.diff, "diff --git a/README.md b/README.md");
+
+        const scoped = yield* driver.getReviewDiffPreview({
+          cwd,
+          baseRef: initialBranch,
+          file: { path: "proj/a.txt", previousPath: null, sourceKind: "working-tree" },
+        });
+        const scopedDirty = scoped.sources.find((entry) => entry.kind === "working-tree")!;
+        assert.deepStrictEqual(scopedDirty.files, [stat("working-tree", "proj/a.txt")]);
+        assert.include(scopedDirty.diff, "+recorded");
+        assert.include(scopedDirty.diff, "+dirty");
+        assert.notInclude(scopedDirty.diff, "b.txt");
+        assert.strictEqual(scoped.sources.find((entry) => entry.kind === "branch-range")!.diff, "");
+
+        const scopedChanges = yield* driver.getReviewDiffPreview({
+          cwd,
+          baseRef: initialBranch,
+          file: { path: "proj/nested/b.txt", previousPath: null, sourceKind: "branch-range" },
+        });
+        const scopedBase = scopedChanges.sources.find((entry) => entry.kind === "branch-range")!;
+        assert.deepStrictEqual(scopedBase.files, [stat("branch-range", "proj/nested/b.txt")]);
+        assert.include(scopedBase.diff, "diff --git a/proj/nested/b.txt b/proj/nested/b.txt");
+        assert.include(scopedBase.diff, "+feature");
+        assert.strictEqual(
+          scopedChanges.sources.find((entry) => entry.kind === "working-tree")!.diff,
+          "",
+        );
+
+        const [dirtyFile, baseFile, addedFile] = yield* Effect.all([
+          driver.getReviewDiffFileContents(
+            makeReviewDiffFileContentsInput(cwd, {
+              oldPath: "proj/a.txt",
+              newPath: "proj/a.txt",
+            }),
+          ),
+          driver.getReviewDiffFileContents(
+            makeReviewDiffFileContentsInput(cwd, {
+              sourceKind: "branch-range",
+              baseRef: initialBranch,
+              headRef: "feature/sub",
+              oldPath: "proj/nested/b.txt",
+              newPath: "proj/nested/b.txt",
+            }),
+          ),
+          driver.getReviewDiffFileContents(
+            makeReviewDiffFileContentsInput(cwd, {
+              sourceKind: "branch-range",
+              baseRef: initialBranch,
+              headRef: "feature/sub",
+              oldPath: "extra/e.txt",
+              newPath: "extra/e.txt",
+            }),
+          ),
+        ]);
+        assert.deepStrictEqual(dirtyFile, {
+          oldContents: "a-base\nfeature\n",
+          newContents: "a-base\nfeature\nrecorded\ndirty\n",
+        });
+        assert.deepStrictEqual(baseFile, {
+          oldContents: "nested-base\n",
+          newContents: "nested-base\nfeature\nunrecorded\ndirty\n",
+        });
+        assert.deepStrictEqual(addedFile, {
+          oldContents: "",
+          newContents: "extra\ndirty\n",
+        });
+      }),
+    );
   });
 
   describe("repository status", () => {

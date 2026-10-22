@@ -32,6 +32,7 @@ import {
   type VcsRef,
 } from "@t3tools/contracts";
 import { dedupeRemoteBranchesWithLocalMatches, normalizeGitRemoteUrl } from "@t3tools/shared/git";
+import { quoteGitPatchPath, unquoteGitPatchPath } from "@t3tools/shared/gitPatchPath";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import { compactTraceAttributes } from "@t3tools/shared/observability";
 import { decodeJsonResult } from "@t3tools/shared/schemaJson";
@@ -209,6 +210,120 @@ function parseReviewNumstat(stdout: string): ReviewDiffFileStat[] {
     });
   }
   return files;
+}
+
+type ReviewDiffSlice = {
+  readonly stdout: string;
+  readonly stdoutTruncated: boolean;
+  readonly files: ReadonlyArray<ReviewDiffFileStat> | undefined;
+};
+
+function prefixReviewDiffStat(file: ReviewDiffFileStat, prefix: string): ReviewDiffFileStat {
+  if (prefix.length === 0) return file;
+  return {
+    path: `${prefix}${file.path}`,
+    previousPath: file.previousPath === null ? null : `${prefix}${file.previousPath}`,
+    additions: file.additions,
+    deletions: file.deletions,
+  };
+}
+
+// `rename from`/`rename to` stay relative to the repo being diffed. The a/ and b/
+// prefixes do not apply to them, so a submodule patch has to gain the superproject
+// directory before a client parses it as one tree.
+function prefixSubmodulePatch(patch: string, prefix: string): string {
+  if (prefix.length === 0) return patch;
+  return patch.replace(/^(rename (?:from|to) )(.*)$/gm, (_match, label: string, raw: string) => {
+    return `${label}${quoteGitPatchPath(`${prefix}${unquoteGitPatchPath(raw)}`)}`;
+  });
+}
+
+function matchInitializedSubmodule(
+  submodulePaths: readonly string[],
+  filePath: string,
+): { readonly submodulePath: string; readonly relativePath: string } | null {
+  let submodulePath: string | null = null;
+  for (const candidate of submodulePaths) {
+    if (filePath !== candidate && !filePath.startsWith(`${candidate}/`)) continue;
+    if (submodulePath === null || candidate.length > submodulePath.length)
+      submodulePath = candidate;
+  }
+  if (submodulePath === null) return null;
+  return {
+    submodulePath,
+    relativePath: filePath === submodulePath ? "" : filePath.slice(submodulePath.length + 1),
+  };
+}
+
+function parentSubmodulePath(
+  submodulePaths: readonly string[],
+  submodulePath: string,
+): string | null {
+  let parent: string | null = null;
+  for (const candidate of submodulePaths) {
+    if (candidate === submodulePath || !submodulePath.startsWith(`${candidate}/`)) continue;
+    if (parent === null || candidate.length > parent.length) parent = candidate;
+  }
+  return parent;
+}
+
+function relativeSubmodulePath(submodulePath: string, filePath: string): string | null {
+  if (filePath === submodulePath) return "";
+  const prefix = `${submodulePath}/`;
+  return filePath.startsWith(prefix) ? filePath.slice(prefix.length) : null;
+}
+
+function directSubmoduleExcludeArgs(
+  submodulePaths: readonly string[],
+  parentPath: string,
+): string[] {
+  const args: string[] = [];
+  for (const candidate of submodulePaths) {
+    const relative =
+      parentPath.length === 0
+        ? candidate
+        : candidate.startsWith(`${parentPath}/`)
+          ? candidate.slice(parentPath.length + 1)
+          : null;
+    if (relative === null || relative.length === 0 || relative.includes("/")) continue;
+    args.push(`:(exclude,literal,top)${relative}`);
+  }
+  return args;
+}
+
+function parseGitlinkCommit(stdout: string): string | null {
+  const match = /^160000 commit ([0-9a-f]+)\t/.exec(stdout);
+  return match?.[1] ?? null;
+}
+
+function resolveRepoPath(pathService: Path.Path, root: string, gitPath: string): string {
+  return gitPath
+    .split("/")
+    .reduce((directory, segment) => pathService.join(directory, segment), root);
+}
+
+function mergeReviewDiffSlices(
+  parts: readonly ReviewDiffSlice[],
+  patchLimit: number,
+): ReviewDiffSlice {
+  let stdout = "";
+  let stdoutTruncated = false;
+  const files: ReviewDiffFileStat[] = [];
+  let filesIncomplete = false;
+  for (const part of parts) {
+    if (part.files === undefined) filesIncomplete = true;
+    else if (!filesIncomplete) files.push(...part.files);
+    if (stdoutTruncated) continue;
+    const room = patchLimit - stdout.length;
+    if (part.stdout.length > room) {
+      stdout += part.stdout.slice(0, Math.max(0, room));
+      stdoutTruncated = true;
+      continue;
+    }
+    stdout += part.stdout;
+    if (part.stdoutTruncated) stdoutTruncated = true;
+  }
+  return { stdout, stdoutTruncated, files: filesIncomplete ? undefined : files };
 }
 
 // Space-separated fields precede the path in each porcelain v2 record type. The path itself
@@ -2915,6 +3030,82 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
     return stdout.trim();
   });
 
+  // Checked-out submodules only. Uninitialized entries stay a gitlink in the superproject diff.
+  const listInitializedSubmodulePaths = Effect.fn("GitVcsDriver.review.submodules")(function* (
+    repoCwd: string,
+  ) {
+    const hasGitmodules = yield* fileSystem.exists(path.join(repoCwd, ".gitmodules")).pipe(
+      Effect.mapError(
+        (cause) =>
+          new GitCommandError({
+            operation: "GitVcsDriver.review.submodules",
+            command: "fs.exists",
+            cwd: repoCwd,
+            detail: "Could not inspect .gitmodules.",
+            cause,
+          }),
+      ),
+    );
+    if (!hasGitmodules) return [];
+    const result = yield* executeGit(
+      "GitVcsDriver.review.submodules",
+      repoCwd,
+      ["submodule", "foreach", "--quiet", "--recursive", "printf '%s\\n' \"$displaypath\""],
+      { maxOutputBytes: REVIEW_METADATA_MAX_OUTPUT_BYTES },
+    );
+    return result.stdout
+      .split("\n")
+      .filter((line) => line.length > 0)
+      .sort((left, right) => (left < right ? -1 : left > right ? 1 : 0));
+  });
+
+  // The commit the superproject records for this submodule at `superRef`, walking nested gitlinks.
+  // Null when that submodule is not in the tree yet.
+  const reviewGitlink = Effect.fn("GitVcsDriver.review.gitlink")(function* (
+    repoRoot: string,
+    superRef: string,
+    submodulePath: string,
+    submodulePaths: readonly string[],
+    cache: Map<string, string | null>,
+  ) {
+    const chain: string[] = [];
+    let cursor: string | null = submodulePath;
+    while (cursor !== null) {
+      chain.push(cursor);
+      cursor = parentSubmodulePath(submodulePaths, cursor);
+    }
+    let sha: string | null = null;
+    for (const entry of chain.toReversed()) {
+      const key = `${superRef}\0${entry}`;
+      const cached = cache.get(key);
+      if (cached !== undefined) {
+        sha = cached;
+        continue;
+      }
+      const parent = parentSubmodulePath(submodulePaths, entry);
+      if (parent !== null && sha === null) {
+        cache.set(key, null);
+        continue;
+      }
+      const listed = yield* executeGit(
+        "GitVcsDriver.review.gitlink",
+        parent === null ? repoRoot : resolveRepoPath(path, repoRoot, parent),
+        [
+          "ls-tree",
+          "-z",
+          "--end-of-options",
+          parent === null ? superRef : sha!,
+          "--",
+          parent === null ? entry : entry.slice(parent.length + 1),
+        ],
+        { allowNonZeroExit: true },
+      );
+      sha = listed.exitCode === 0 ? parseGitlinkCommit(listed.stdout) : null;
+      cache.set(key, sha);
+    }
+    return sha;
+  });
+
   const prepareUntrackedReviewIndex = Effect.fn("prepareUntrackedReviewIndex")(function* (
     cwd: string,
     pathArgs: ReadonlyArray<string>,
@@ -3049,11 +3240,6 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
   const getReviewDiffPreview = Effect.fn("getReviewDiffPreview")(function* (
     input: ReviewDiffPreviewInput,
   ) {
-    const pathArgs = input.file
-      ? [input.file.path, ...(input.file.previousPath ? [input.file.previousPath] : [])].map(
-          (path) => `:(top,literal)${path}`,
-        )
-      : [];
     const patchLimit = input.file
       ? REVIEW_DIFF_FILE_MAX_OUTPUT_BYTES
       : REVIEW_DIFF_PATCH_MAX_OUTPUT_BYTES;
@@ -3082,69 +3268,185 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       ...REVIEW_DIFF_ARGS,
       ...(input.ignoreWhitespace ? ["--ignore-all-space"] : []),
     ];
+    // A superproject diff stops at the gitlink. Each checked-out submodule is diffed against the
+    // commit that gitlink records and prefixed so the patch reads as one tree from this root.
+    const submodulePaths = yield* listInitializedSubmodulePaths(cwd);
+    const requested = input.file
+      ? matchInitializedSubmodule(submodulePaths, input.file.path)
+      : null;
+    const gitlinks = new Map<string, string | null>();
     const readStats = Effect.fn("GitVcsDriver.getReviewDiffPreview.stat")(function* (
+      repoCwd: string,
       ref: string,
-      env?: NodeJS.ProcessEnv,
+      env: NodeJS.ProcessEnv | undefined,
+      diffPathArgs: ReadonlyArray<string>,
+      statPrefix: string,
+      prefixArgs: ReadonlyArray<string>,
     ) {
-      const args = [...diffArgs, "--numstat", "-z"];
+      const args = [...diffArgs, ...prefixArgs, "--numstat", "-z"];
       const result = yield* executeGit(
         "GitVcsDriver.getReviewDiffPreview.stat",
-        cwd,
-        [...args, ref, "--", ...pathArgs],
+        repoCwd,
+        [...args, ref, "--", ...diffPathArgs],
         { allowNonZeroExit: true, maxOutputBytes: REVIEW_METADATA_MAX_OUTPUT_BYTES, env },
       );
-      if (result.exitCode === 0) return { ref, files: parseReviewNumstat(result.stdout) };
+      const filesFrom = (stdout: string) =>
+        parseReviewNumstat(stdout).map((file) => prefixReviewDiffStat(file, statPrefix));
+      if (result.exitCode === 0) return { ref, files: filesFrom(result.stdout) };
       if (ref === "HEAD" && isUnbornHeadStderr(result.stderr)) {
-        const emptyTree = yield* readEmptyTreeHash(cwd);
+        const emptyTree = yield* readEmptyTreeHash(repoCwd);
         const stdout = yield* runGitStdoutWithOptions(
           "GitVcsDriver.getReviewDiffPreview.unbornStat",
-          cwd,
-          [...args, emptyTree, "--", ...pathArgs],
+          repoCwd,
+          [...args, emptyTree, "--", ...diffPathArgs],
           { maxOutputBytes: REVIEW_METADATA_MAX_OUTPUT_BYTES, env },
         );
-        return { ref: emptyTree, files: parseReviewNumstat(stdout) };
+        return { ref: emptyTree, files: filesFrom(stdout) };
       }
       return yield* new GitCommandError({
         operation: "GitVcsDriver.getReviewDiffPreview.stat",
-        cwd,
+        cwd: repoCwd,
         command: "git diff --numstat",
         detail: "Could not read complete diff statistics.",
         exitCode: result.exitCode,
       });
     });
     const readTrackedDiff = Effect.fn("GitVcsDriver.getReviewDiffPreview.tracked")(function* (
+      repoCwd: string,
       ref: string | null,
-      env?: NodeJS.ProcessEnv,
+      env: NodeJS.ProcessEnv | undefined,
+      diffPathArgs: ReadonlyArray<string>,
+      statPrefix: string,
+      prefixArgs: ReadonlyArray<string>,
     ) {
       if (ref === null) return { stdout: "", stdoutTruncated: false, files: [] };
-      const stat = yield* readStats(ref, env);
-      if (stat.files.length === 0) return { stdout: "", stdoutTruncated: false, files: [] };
+      const stat = yield* readStats(repoCwd, ref, env, diffPathArgs, statPrefix, prefixArgs);
+      if (stat.files.length === 0) return { stdout: "", stdoutTruncated: false, files: stat.files };
       const patch = yield* executeGit(
         "GitVcsDriver.getReviewDiffPreview.patch",
-        cwd,
-        [...diffArgs, "--patch", stat.ref, "--", ...pathArgs],
+        repoCwd,
+        [...diffArgs, ...prefixArgs, "--patch", stat.ref, "--", ...diffPathArgs],
         { maxOutputBytes: patchLimit, appendTruncationMarker: true, env },
       );
-      return { ...patch, files: stat.files };
+      const stdout = prefixSubmodulePatch(patch.stdout, statPrefix);
+      return {
+        stdout: stdout.length > patchLimit ? stdout.slice(0, patchLimit) : stdout,
+        stdoutTruncated: patch.stdoutTruncated || stdout.length > patchLimit,
+        files: stat.files,
+      };
     });
-    const [dirtyTrackedResult, baseResult] = yield* Effect.gen(function* () {
-      const untracked = yield* prepareUntrackedReviewIndex(cwd, pathArgs, input.file?.path);
-      const [dirty, base] =
-        review.mergeBase === dirtyRef
-          ? yield* readTrackedDiff(dirtyRef, untracked?.env).pipe(
-              Effect.map((result) => [result, result] as const),
-            )
-          : yield* Effect.all(
-              [
-                readTrackedDiff(dirtyRef, untracked?.env),
-                readTrackedDiff(review.mergeBase, untracked?.env),
-              ],
-              { concurrency: 2 },
+    const readRepositoryDiffs = Effect.fn("GitVcsDriver.getReviewDiffPreview.repository")(
+      function* (
+        repo: {
+          readonly repoCwd: string;
+          readonly diffPathArgs: ReadonlyArray<string>;
+          readonly listPathArgs: ReadonlyArray<string>;
+          readonly onlyPath: string | undefined;
+          readonly statPrefix: string;
+          readonly prefixArgs: ReadonlyArray<string>;
+        },
+        refs: { readonly dirty: string | null; readonly base: string | null },
+      ) {
+        const untracked = yield* prepareUntrackedReviewIndex(
+          repo.repoCwd,
+          repo.listPathArgs,
+          repo.onlyPath,
+        );
+        const read = (ref: string | null) =>
+          readTrackedDiff(
+            repo.repoCwd,
+            ref,
+            untracked?.env,
+            repo.diffPathArgs,
+            repo.statPrefix,
+            repo.prefixArgs,
+          );
+        const [dirty, base] =
+          refs.dirty !== null && refs.dirty === refs.base
+            ? yield* read(refs.dirty).pipe(Effect.map((result) => [result, result] as const))
+            : yield* Effect.all([read(refs.dirty), read(refs.base)], { concurrency: 2 });
+        if (untracked !== null) return { dirty, base };
+        const incomplete = (ref: string | null, result: typeof dirty): ReviewDiffSlice =>
+          ref === null ? result : { ...result, files: undefined, stdoutTruncated: true };
+        return { dirty: incomplete(refs.dirty, dirty), base: incomplete(refs.base, base) };
+      },
+    );
+    const repositorySpec = (
+      parentPath: string,
+      file?: { readonly path: string; readonly previousPath: string | null },
+    ) => {
+      const statPrefix = parentPath.length === 0 ? "" : `${parentPath}/`;
+      const paths =
+        file === undefined
+          ? []
+          : [file.path, ...(file.previousPath ? [file.previousPath] : [])].filter(
+              (entry) => entry.length > 0,
             );
-      if (untracked !== null) return [dirty, base] as const;
-      const incomplete = (ref: string | null, result: typeof dirty) =>
-        ref === null ? result : { ...result, files: undefined, stdoutTruncated: true };
-      return [incomplete(dirtyRef, dirty), incomplete(review.mergeBase, base)] as const;
+      const listPathArgs = paths.map((entry) => `:(top,literal)${entry}`);
+      return {
+        repoCwd: parentPath.length === 0 ? cwd : resolveRepoPath(path, cwd, parentPath),
+        diffPathArgs:
+          file === undefined
+            ? directSubmoduleExcludeArgs(submodulePaths, parentPath)
+            : listPathArgs,
+        listPathArgs,
+        onlyPath: file?.path.length ? file.path : undefined,
+        statPrefix,
+        prefixArgs:
+          parentPath.length === 0
+            ? []
+            : ([`--src-prefix=a/${statPrefix}`, `--dst-prefix=b/${statPrefix}`] as const),
+      };
+    };
+    const submoduleBaseline = Effect.fn("GitVcsDriver.review.submoduleBaseline")(function* (
+      superRef: string | null,
+      submodulePath: string,
+      emptyTree: string,
+    ) {
+      if (superRef === null) return null;
+      return (
+        (yield* reviewGitlink(cwd, superRef, submodulePath, submodulePaths, gitlinks)) ?? emptyTree
+      );
+    });
+    const { dirty: dirtyTrackedResult, base: baseResult } = yield* Effect.gen(function* () {
+      if (requested !== null && input.file) {
+        const relativePrevious =
+          input.file.previousPath === null
+            ? null
+            : relativeSubmodulePath(requested.submodulePath, input.file.previousPath);
+        const file =
+          requested.relativePath.length === 0
+            ? undefined
+            : { path: requested.relativePath, previousPath: relativePrevious };
+        const emptyTree = yield* readEmptyTreeHash(cwd);
+        return yield* readRepositoryDiffs(repositorySpec(requested.submodulePath, file), {
+          dirty: yield* submoduleBaseline(dirtyRef, requested.submodulePath, emptyTree),
+          base: yield* submoduleBaseline(review.mergeBase, requested.submodulePath, emptyTree),
+        });
+      }
+      const root = yield* readRepositoryDiffs(
+        repositorySpec(
+          "",
+          input.file ? { path: input.file.path, previousPath: input.file.previousPath } : undefined,
+        ),
+        { dirty: dirtyRef, base: review.mergeBase },
+      );
+      if (input.file || submodulePaths.length === 0) return root;
+      const emptyTree = yield* readEmptyTreeHash(cwd);
+      const dirtyParts: ReviewDiffSlice[] = [root.dirty];
+      const baseParts: ReviewDiffSlice[] = [root.base];
+      for (const submodulePath of submodulePaths) {
+        const part = yield* readRepositoryDiffs(repositorySpec(submodulePath), {
+          dirty: yield* submoduleBaseline(dirtyRef, submodulePath, emptyTree),
+          base: yield* submoduleBaseline(review.mergeBase, submodulePath, emptyTree),
+        });
+        dirtyParts.push(part.dirty);
+        baseParts.push(part.base);
+      }
+      return {
+        dirty: mergeReviewDiffSlices(dirtyParts, patchLimit),
+        base: mergeReviewDiffSlices(baseParts, patchLimit),
+      };
     }).pipe(Effect.scoped);
     const dirtyFiles = dirtyTrackedResult.files;
     const baseFiles = baseResult.files;
@@ -3319,11 +3621,42 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       input.sourceKind === "working-tree"
         ? (input.baseRef ?? "HEAD")
         : (yield* resolveReviewMergeBase(input.cwd, null, input.baseRef ?? undefined)).mergeBase;
+    const submodulePaths =
+      input.oldPath.includes("/") || input.newPath.includes("/")
+        ? yield* listInitializedSubmodulePaths(repositoryRoot)
+        : [];
+    const oldMatch =
+      input.changeType === "new" ? null : matchInitializedSubmodule(submodulePaths, input.oldPath);
+    const gitlinks = new Map<string, string | null>();
     const [oldContents, newContents] = yield* Effect.all(
       [
         input.changeType === "new"
           ? Effect.succeed("")
-          : readReviewFileAtRevision(input, oldRevision, input.oldPath),
+          : oldMatch !== null && oldMatch.relativePath.length > 0
+            ? Effect.gen(function* () {
+                const sha = yield* reviewGitlink(
+                  repositoryRoot,
+                  oldRevision,
+                  oldMatch.submodulePath,
+                  submodulePaths,
+                  gitlinks,
+                );
+                if (sha === null) return "";
+                const result = yield* executeGit(
+                  "GitVcsDriver.getReviewDiffFileContents.revision",
+                  resolveRepoPath(path, repositoryRoot, oldMatch.submodulePath),
+                  ["show", "--end-of-options", `${sha}:${oldMatch.relativePath}`],
+                  { maxOutputBytes: REVIEW_DIFF_FILE_MAX_OUTPUT_BYTES },
+                );
+                if (result.stdout.includes("\0")) {
+                  return yield* reviewDiffFileError(
+                    input,
+                    `Cannot expand binary file '${input.oldPath}'.`,
+                  );
+                }
+                return result.stdout;
+              })
+            : readReviewFileAtRevision(input, oldRevision, input.oldPath),
         input.changeType === "deleted"
           ? Effect.succeed("")
           : readWorkingTreeReviewFile(input, repositoryRoot),
