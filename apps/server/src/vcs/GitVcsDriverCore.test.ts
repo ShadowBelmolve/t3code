@@ -3131,6 +3131,214 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
         }
       }),
     );
+
+    it.effect("flattens nested submodule changes onto the superproject", () =>
+      Effect.gen(function* () {
+        const allowFile = { GIT_ALLOW_PROTOCOL: "file" };
+        const pathService = yield* Path.Path;
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+        const configure = (repo: string) =>
+          Effect.all(
+            [
+              git(repo, ["config", "user.email", "test@test.com"]),
+              git(repo, ["config", "user.name", "Test"]),
+            ],
+            { discard: true },
+          );
+        const makeRepo = (prefix: string, file: string, contents: string) =>
+          Effect.gen(function* () {
+            const repo = yield* makeTmpDir(prefix);
+            yield* initRepoWithCommit(repo);
+            yield* writeTextFile(repo, file, contents);
+            yield* git(repo, ["add", "."]);
+            yield* git(repo, ["commit", "-m", file]);
+            return repo;
+          });
+
+        const nestedRepo = yield* makeRepo("review-nested-", "b.txt", "nested-base\n");
+        const projRepo = yield* makeRepo("review-proj-", "a.txt", "a-base\n");
+        yield* git(projRepo, ["submodule", "add", nestedRepo, "nested"], allowFile);
+        yield* git(projRepo, ["add", "."]);
+        yield* git(projRepo, ["commit", "-m", "proj"]);
+        const vendorRepo = yield* makeRepo("review-vendor-", "v.txt", "vendor\n");
+        const extraRepo = yield* makeRepo("review-extra-", "e.txt", "extra\n");
+
+        const cwd = yield* makeTmpDir("review-super-");
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        yield* git(cwd, ["submodule", "add", projRepo, "proj"], allowFile);
+        yield* git(cwd, ["submodule", "add", vendorRepo, "vendor"], allowFile);
+        yield* git(cwd, ["commit", "-m", "add submodules"]);
+        yield* git(cwd, ["submodule", "update", "--init", "--recursive"], allowFile);
+        yield* git(cwd, ["submodule", "deinit", "-f", "vendor"]);
+        const proj = pathService.join(cwd, "proj");
+        const nested = pathService.join(proj, "nested");
+        yield* configure(proj);
+        yield* configure(nested);
+
+        yield* git(cwd, ["checkout", "-b", "feature/sub"]);
+        yield* writeTextFile(vendorRepo, "v.txt", "vendor-next\n");
+        yield* git(vendorRepo, ["commit", "-am", "vendor next"]);
+        const vendorNext = yield* git(vendorRepo, ["rev-parse", "HEAD"]);
+        yield* git(cwd, ["update-index", "--cacheinfo", `160000,${vendorNext},vendor`]);
+        yield* git(cwd, ["commit", "-m", "bump uninitialized vendor"]);
+        yield* writeTextFile(cwd, "README.md", "# test\nfeature\n");
+        yield* git(cwd, ["commit", "-am", "root feature"]);
+        yield* writeTextFile(nested, "b.txt", "nested-base\nfeature\n");
+        yield* git(nested, ["commit", "-am", "nested feature"]);
+        yield* writeTextFile(proj, "a.txt", "a-base\nfeature\n");
+        yield* git(proj, ["add", "a.txt", "nested"]);
+        yield* git(proj, ["commit", "-m", "proj feature"]);
+        yield* git(cwd, ["add", "proj"]);
+        yield* git(cwd, ["commit", "-m", "record proj"]);
+        yield* git(cwd, ["submodule", "add", extraRepo, "extra"], allowFile);
+        yield* git(cwd, ["commit", "-m", "add extra"]);
+        const extra = pathService.join(cwd, "extra");
+        yield* configure(extra);
+
+        // Commits inside the submodules that the superproject has not recorded.
+        yield* writeTextFile(proj, "a.txt", "a-base\nfeature\nrecorded\n");
+        yield* git(proj, ["commit", "-am", "proj only"]);
+        yield* writeTextFile(nested, "b.txt", "nested-base\nfeature\nunrecorded\n");
+        yield* git(nested, ["commit", "-am", "nested only"]);
+        yield* writeTextFile(cwd, "README.md", "# test\nfeature\ndirty\n");
+        yield* writeTextFile(proj, "a.txt", "a-base\nfeature\nrecorded\ndirty\n");
+        yield* writeTextFile(nested, "b.txt", "nested-base\nfeature\nunrecorded\ndirty\n");
+        yield* writeTextFile(extra, "e.txt", "extra\ndirty\n");
+        yield* writeTextFile(proj, "untracked.txt", "untracked\n");
+        yield* writeTextFile(cwd, "root-new.txt", "root-new\n");
+        // A gitlink with no .gitmodules URL. `submodule foreach --recursive` exits 128 here.
+        const odd = yield* git(proj, ["rev-parse", "HEAD"]);
+        yield* git(proj, [
+          "update-index",
+          "--add",
+          "--cacheinfo",
+          `160000,${odd},.repos/alchemy-effect/submodules/distilled`,
+        ]);
+        yield* git(proj, ["rm", "README.md"]);
+
+        const preview = yield* driver.getReviewDiffPreview({ cwd, baseRef: initialBranch });
+        const source = (kind: "working-tree" | "branch-range") =>
+          preview.sources.find((entry) => entry.kind === kind)!;
+        const stat = (kind: "working-tree" | "branch-range", filePath: string) => {
+          const file = source(kind).files!.find((entry) => entry.path === filePath);
+          if (file === undefined) return assert.fail(`missing ${filePath}`);
+          return file;
+        };
+        const dirty = source("working-tree");
+        const changes = source("branch-range");
+
+        for (const [kind, filePath, additions, deletions = 0] of [
+          ["working-tree", "README.md", 1],
+          ["working-tree", "root-new.txt", 1],
+          ["working-tree", "proj/a.txt", 2],
+          ["working-tree", "proj/nested/b.txt", 2],
+          ["working-tree", "proj/untracked.txt", 1],
+          ["working-tree", "proj/README.md", 0, 1],
+          ["working-tree", "extra/e.txt", 1],
+          ["branch-range", "proj/a.txt", 3],
+          ["branch-range", "proj/nested/b.txt", 3],
+          ["branch-range", "extra/e.txt", 2],
+          ["branch-range", "extra/README.md", 1],
+        ] as const) {
+          assert.deepStrictEqual(stat(kind, filePath), {
+            path: filePath,
+            previousPath: null,
+            additions,
+            deletions,
+          });
+        }
+        for (const kind of ["working-tree", "branch-range"] as const) {
+          const paths = source(kind).files!.map((file) => file.path);
+          assert.notInclude(paths, "proj");
+          assert.notInclude(paths, "proj/nested");
+          assert.notInclude(paths, "extra");
+          assert.isFalse(
+            paths.some(
+              (filePath) =>
+                filePath.startsWith("vendor/") ||
+                filePath.startsWith("proj/.repos/alchemy-effect/submodules/distilled"),
+            ),
+          );
+        }
+        assert.notInclude(dirty.diff, "Subproject commit");
+        assert.include(changes.diff, "Subproject commit");
+        assert.notInclude(changes.diff, "vendor-next");
+        assert.include(dirty.diff, "diff --git a/proj/a.txt b/proj/a.txt");
+        assert.include(dirty.diff, "diff --git a/proj/nested/b.txt b/proj/nested/b.txt");
+        assert.include(dirty.diff, "diff --git a/proj/untracked.txt b/proj/untracked.txt");
+        assert.include(dirty.diff, "+recorded");
+        assert.include(dirty.diff, "+unrecorded");
+        assert.notInclude(dirty.diff, "+feature");
+        assert.include(changes.diff, "+feature");
+        assert.include(changes.diff, "diff --git a/extra/e.txt b/extra/e.txt");
+        assert.include(changes.diff, "diff --git a/README.md b/README.md");
+
+        const scoped = yield* driver.getReviewDiffPreview({
+          cwd,
+          baseRef: initialBranch,
+          file: { path: "proj/a.txt", previousPath: null, sourceKind: "working-tree" },
+        });
+        const scopedDirty = scoped.sources.find((entry) => entry.kind === "working-tree")!;
+        assert.deepStrictEqual(scopedDirty.files, [stat("working-tree", "proj/a.txt")]);
+        assert.include(scopedDirty.diff, "+recorded");
+        assert.include(scopedDirty.diff, "+dirty");
+        assert.notInclude(scopedDirty.diff, "b.txt");
+        assert.strictEqual(scoped.sources.find((entry) => entry.kind === "branch-range")!.diff, "");
+
+        const scopedChanges = yield* driver.getReviewDiffPreview({
+          cwd,
+          baseRef: initialBranch,
+          file: { path: "proj/nested/b.txt", previousPath: null, sourceKind: "branch-range" },
+        });
+        const scopedBase = scopedChanges.sources.find((entry) => entry.kind === "branch-range")!;
+        assert.deepStrictEqual(scopedBase.files, [stat("branch-range", "proj/nested/b.txt")]);
+        assert.include(scopedBase.diff, "diff --git a/proj/nested/b.txt b/proj/nested/b.txt");
+        assert.include(scopedBase.diff, "+feature");
+        assert.strictEqual(
+          scopedChanges.sources.find((entry) => entry.kind === "working-tree")!.diff,
+          "",
+        );
+
+        const [dirtyFile, baseFile, addedFile] = yield* Effect.all([
+          driver.getReviewDiffFileContents(
+            makeReviewDiffFileContentsInput(cwd, {
+              oldPath: "proj/a.txt",
+              newPath: "proj/a.txt",
+            }),
+          ),
+          driver.getReviewDiffFileContents(
+            makeReviewDiffFileContentsInput(cwd, {
+              sourceKind: "branch-range",
+              baseRef: initialBranch,
+              headRef: "feature/sub",
+              oldPath: "proj/nested/b.txt",
+              newPath: "proj/nested/b.txt",
+            }),
+          ),
+          driver.getReviewDiffFileContents(
+            makeReviewDiffFileContentsInput(cwd, {
+              sourceKind: "branch-range",
+              baseRef: initialBranch,
+              headRef: "feature/sub",
+              oldPath: "extra/e.txt",
+              newPath: "extra/e.txt",
+            }),
+          ),
+        ]);
+        assert.deepStrictEqual(dirtyFile, {
+          oldContents: "a-base\nfeature\n",
+          newContents: "a-base\nfeature\nrecorded\ndirty\n",
+        });
+        assert.deepStrictEqual(baseFile, {
+          oldContents: "nested-base\n",
+          newContents: "nested-base\nfeature\nunrecorded\ndirty\n",
+        });
+        assert.deepStrictEqual(addedFile, {
+          oldContents: "",
+          newContents: "extra\ndirty\n",
+        });
+      }),
+    );
   });
 
   describe("repository status", () => {
