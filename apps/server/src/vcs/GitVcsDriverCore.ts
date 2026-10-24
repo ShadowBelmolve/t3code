@@ -2153,7 +2153,8 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       Effect.catchTags({ GitCommandError: () => Effect.succeed(null) }),
     );
     const statusCacheKey = repositoryPaths?.gitCommonDir;
-    const [numstatEntries, defaultBranch, hasPrimaryRemote] = yield* Effect.all(
+    const worktreeRoot = repositoryPaths?.worktreeRoot ?? cwd;
+    const [numstatEntries, defaultBranch, hasPrimaryRemote, submodulePaths] = yield* Effect.all(
       [
         // Plumbing, because porcelain `git diff` rewrites the index even with
         // GIT_OPTIONAL_LOCKS=0. -M keeps porcelain's rename detection.
@@ -2207,6 +2208,9 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
         statusCacheKey
           ? Cache.get(originExistsCache, statusCacheKey).pipe(Effect.orElseSucceed(() => false))
           : originRemoteExists(cwd).pipe(Effect.orElseSucceed(() => false)),
+        listInitializedSubmodulePaths(worktreeRoot).pipe(
+          Effect.orElseSucceed(() => [] as string[]),
+        ),
       ],
       { concurrency: "unbounded" },
     );
@@ -2274,8 +2278,22 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
           : yield* computeAheadCountAgainstBase(cwd, refName).pipe(Effect.orElseSucceed(() => 0));
     }
 
+    const submodulePathSet = new Set(submodulePaths);
+    const [submoduleFiles, branchChanges] = yield* Effect.all(
+      [
+        readSubmoduleHeadNumstat(worktreeRoot, submodulePaths),
+        options?.includeBranchChanges
+          ? readBranchChangeTotals(worktreeRoot, refName, submodulePaths).pipe(
+              Effect.orElseSucceed(() => undefined),
+            )
+          : Effect.succeed(undefined),
+      ],
+      { concurrency: 2 },
+    );
+
     const fileStatMap = new Map<string, { insertions: number; deletions: number }>();
-    for (const entry of numstatEntries) {
+    for (const entry of numstatEntries.concat(submoduleFiles)) {
+      if (submodulePathSet.has(entry.path)) continue;
       const stat = fileStatMap.get(entry.path) ?? { insertions: 0, deletions: 0 };
       stat.insertions += entry.additions;
       stat.deletions += entry.deletions;
@@ -2293,16 +2311,19 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       .toSorted((a, b) => a.path.localeCompare(b.path));
 
     for (const filePath of changedFilesWithoutNumstat) {
-      if (fileStatMap.has(filePath)) continue;
+      if (fileStatMap.has(filePath) || submodulePathSet.has(filePath)) continue;
       files.push({ path: filePath, insertions: 0, deletions: 0 });
     }
     files.sort((a, b) => a.path.localeCompare(b.path));
 
-    const branchChanges = options?.includeBranchChanges
-      ? yield* readBranchChangeTotals(repositoryPaths?.worktreeRoot ?? cwd, refName).pipe(
-          Effect.orElseSucceed(() => undefined),
-        )
-      : undefined;
+    // Submodule pins are excluded from the merge-base diff. Add each submodule's own HEAD totals.
+    if (branchChanges) {
+      for (const entry of submoduleFiles) {
+        if (submodulePathSet.has(entry.path)) continue;
+        branchChanges.insertions += entry.additions;
+        branchChanges.deletions += entry.deletions;
+      }
+    }
 
     return {
       isRepo: true,
@@ -3068,6 +3089,56 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
     return { env };
   });
 
+  // The root gitlink is the superproject pin. Counts are each checked-out
+  // submodule's staged, unstaged, and untracked files against that submodule's HEAD.
+  const readSubmoduleHeadNumstat = Effect.fn("GitVcsDriver.statusDetails.submoduleNumstat")(
+    function* (worktreeRoot: string, submodulePaths: readonly string[]) {
+      if (submodulePaths.length === 0) return [];
+      const parts = yield* Effect.scoped(
+        Effect.forEach(
+          submodulePaths,
+          (submodulePath) =>
+            Effect.gen(function* () {
+              const repoCwd = path.join(worktreeRoot, submodulePath);
+              const exclude = directSubmoduleExcludeArgs(submodulePaths, submodulePath);
+              const untracked = yield* prepareUntrackedReviewIndex(repoCwd, []).pipe(
+                Effect.orElseSucceed(() => null),
+              );
+              const result = yield* executeGitWithStableDiagnostics(
+                "GitVcsDriver.statusDetails.submoduleNumstat",
+                repoCwd,
+                untracked?.env === undefined
+                  ? ["diff-index", "-M", "--numstat", "-z", "HEAD", "--", ...exclude]
+                  : [
+                      "diff",
+                      "-M",
+                      "--numstat",
+                      "-z",
+                      "--no-ext-diff",
+                      "--no-textconv",
+                      "HEAD",
+                      "--",
+                      ...exclude,
+                    ],
+                {
+                  allowNonZeroExit: true,
+                  maxOutputBytes: REVIEW_METADATA_MAX_OUTPUT_BYTES,
+                  ...(untracked?.env !== undefined ? { env: untracked.env } : {}),
+                },
+              );
+              if (result.exitCode !== 0 || result.stdoutTruncated) return [];
+              const prefix = `${submodulePath}/`;
+              return parseReviewNumstat(result.stdout).map((file) =>
+                prefixReviewDiffStat(file, prefix),
+              );
+            }).pipe(Effect.orElseSucceed(() => [] as ReadonlyArray<ReviewDiffFileStat>)),
+          { concurrency: "unbounded" },
+        ),
+      );
+      return parts.flat();
+    },
+  );
+
   const resolveReviewMergeBase = Effect.fn("resolveReviewMergeBase")(function* (
     cwd: string,
     branch: string | null,
@@ -3116,6 +3187,7 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
   const readBranchChangeTotals = Effect.fn("readBranchChangeTotals")(function* (
     cwd: string,
     branch: string | null,
+    submodulePaths: readonly string[],
   ) {
     const { baseRef, mergeBase } = yield* resolveReviewMergeBase(cwd, branch);
     const untracked = yield* prepareUntrackedReviewIndex(cwd, []);
@@ -3127,11 +3199,12 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
         detail: "Too many untracked files to count.",
       });
     }
+    const exclude = directSubmoduleExcludeArgs(submodulePaths, "");
     const readNumstat = (ref: string) =>
       executeGit(
         "GitVcsDriver.readBranchChangeTotals",
         cwd,
-        [...REVIEW_DIFF_ARGS, "--numstat", "-z", ref, "--"],
+        [...REVIEW_DIFF_ARGS, "--numstat", "-z", ref, "--", ...exclude],
         {
           allowNonZeroExit: true,
           maxOutputBytes: REVIEW_METADATA_MAX_OUTPUT_BYTES,
