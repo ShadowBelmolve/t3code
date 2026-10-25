@@ -2343,7 +2343,6 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
     // Submodule pins are excluded from the merge-base diff. Add each submodule's own HEAD totals.
     if (branchChanges) {
       for (const entry of submoduleFiles) {
-        if (submodulePathSet.has(entry.path)) continue;
         branchChanges.insertions += entry.additions;
         branchChanges.deletions += entry.deletions;
       }
@@ -3133,17 +3132,7 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
                 repoCwd,
                 untracked?.env === undefined
                   ? ["diff-index", "-M", "--numstat", "-z", "HEAD", "--", ...exclude]
-                  : [
-                      "diff",
-                      "-M",
-                      "--numstat",
-                      "-z",
-                      "--no-ext-diff",
-                      "--no-textconv",
-                      "HEAD",
-                      "--",
-                      ...exclude,
-                    ],
+                  : [...REVIEW_DIFF_ARGS, "--numstat", "-z", "HEAD", "--", ...exclude],
                 {
                   allowNonZeroExit: true,
                   maxOutputBytes: REVIEW_METADATA_MAX_OUTPUT_BYTES,
