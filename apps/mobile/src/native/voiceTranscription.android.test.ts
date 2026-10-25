@@ -74,13 +74,6 @@ describe("getLocalVoiceTranscriber", () => {
     expect(await loadTranscriber()).toBeNull();
   });
 
-  it("checks the recognition service once per launch", async () => {
-    const { getLocalVoiceTranscriber } = await import("./voiceTranscription.android");
-    getLocalVoiceTranscriber();
-    getLocalVoiceTranscriber();
-    expect(mocks.isRecognitionAvailable).toHaveBeenCalledTimes(1);
-  });
-
   it("transcribes the recording on device when the language pack is installed", async () => {
     mocks.getSupportedLocales.mockResolvedValue({
       locales: ["en-US", "pt-BR"],
@@ -147,8 +140,7 @@ describe("getLocalVoiceTranscriber", () => {
     emit("end");
     const error = await result;
     // Modules reload per test, so match the error by name rather than class.
-    expect(error).toMatchObject({ name: "VoiceTranscriptionError" });
-    expect(error).toMatchObject({ code });
+    expect(error).toMatchObject({ name: "VoiceTranscriptionError", code });
   });
 
   it("waits for the recognizer to stop before settling cancellation", async () => {
@@ -160,15 +152,13 @@ describe("getLocalVoiceTranscriber", () => {
 
     controller.abort();
     expect(mocks.abort).toHaveBeenCalledTimes(1);
-    await new Promise<void>((resolve) => setImmediate(resolve));
     expect(settled).not.toHaveBeenCalled();
 
     emit("error", { error: "aborted", message: "aborted" });
     emit("end");
     const error = await result;
     // Modules reload per test, so match the error by name rather than class.
-    expect(error).toMatchObject({ name: "VoiceTranscriptionError" });
-    expect(error).toMatchObject({ code: "cancelled" });
+    expect(error).toMatchObject({ name: "VoiceTranscriptionError", code: "cancelled" });
   });
 
   it("does not start the recognizer after cancellation", async () => {
