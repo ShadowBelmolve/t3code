@@ -2415,6 +2415,60 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
   });
 
   describe("repository status", () => {
+    it.effect("counts a dirty submodule against its own HEAD", () =>
+      Effect.gen(function* () {
+        const allowFile = { GIT_ALLOW_PROTOCOL: "file" };
+        const pathService = yield* Path.Path;
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+        const sub = yield* makeTmpDir("status-sub-");
+        yield* initRepoWithCommit(sub);
+        yield* writeTextFile(sub, "tracked.txt", "pin\n");
+        yield* git(sub, ["add", "tracked.txt"]);
+        yield* git(sub, ["commit", "-m", "pin"]);
+
+        const cwd = yield* makeTmpDir("status-super-");
+        yield* initRepoWithCommit(cwd);
+        yield* git(cwd, ["branch", "-M", "main"]);
+        yield* git(cwd, ["submodule", "add", sub, "salesforce-project"], allowFile);
+        yield* git(cwd, ["commit", "-m", "pin submodule"]);
+        yield* git(cwd, ["checkout", "-b", "feature/sub"]);
+        yield* writeTextFile(cwd, "README.md", "# test\nfeature\n");
+        yield* git(cwd, ["add", "README.md"]);
+        yield* git(cwd, ["commit", "-m", "feature"]);
+
+        const project = pathService.join(cwd, "salesforce-project");
+        yield* git(project, ["config", "user.email", "test@test.com"]);
+        yield* git(project, ["config", "user.name", "Test"]);
+        yield* writeTextFile(project, "tracked.txt", "pin\nbeyond\n");
+        yield* git(project, ["commit", "-am", "beyond pin"]);
+        yield* writeTextFile(project, "tracked.txt", "beyond\ndirty\n");
+        yield* writeTextFile(project, "staged.txt", "staged\n");
+        yield* git(project, ["add", "staged.txt"]);
+        yield* writeTextFile(project, "untracked.txt", "untracked\n");
+        const odd = yield* git(project, ["rev-parse", "HEAD"]);
+        yield* git(project, [
+          "update-index",
+          "--add",
+          "--cacheinfo",
+          `160000,${odd},.repos/alchemy-effect/submodules/distilled`,
+        ]);
+
+        const status = yield* driver.statusDetailsLocal(cwd, { includeBranchChanges: true });
+        assert.deepEqual(status.workingTree.files, [
+          { path: "salesforce-project/staged.txt", insertions: 1, deletions: 0 },
+          { path: "salesforce-project/tracked.txt", insertions: 1, deletions: 1 },
+          { path: "salesforce-project/untracked.txt", insertions: 1, deletions: 0 },
+        ]);
+        assert.equal(status.workingTree.insertions, 3);
+        assert.equal(status.workingTree.deletions, 1);
+        assert.deepEqual(status.branchChanges, {
+          baseRef: "main",
+          insertions: 4,
+          deletions: 1,
+        });
+      }),
+    );
+
     it.effect("does not open a project folder laid out as a bare repository", () =>
       Effect.gen(function* () {
         const cwd = yield* makeTmpDir();
