@@ -2,14 +2,6 @@ import { describe, expect, it, vi } from "vite-plus/test";
 
 import { createVoiceRecordingPermission } from "./voiceInputPermission";
 
-function deferred<T>() {
-  let resolve!: (value: T) => void;
-  const promise = new Promise<T>((next) => {
-    resolve = next;
-  });
-  return { promise, resolve };
-}
-
 describe("createVoiceRecordingPermission", () => {
   it("does not open the system prompt when access is already granted", async () => {
     const request = vi.fn();
@@ -24,7 +16,7 @@ describe("createVoiceRecordingPermission", () => {
   });
 
   it("reports the prompt as open until the request settles", async () => {
-    const result = deferred<{ granted: boolean; canAskAgain: boolean }>();
+    const result = Promise.withResolvers<{ granted: boolean; canAskAgain: boolean }>();
     const permission = createVoiceRecordingPermission({
       get: async () => ({ granted: false, canAskAgain: true }),
       request: () => result.promise,
