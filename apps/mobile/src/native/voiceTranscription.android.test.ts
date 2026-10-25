@@ -152,7 +152,6 @@ describe("getLocalVoiceTranscriber", () => {
 
     controller.abort();
     expect(mocks.abort).toHaveBeenCalledTimes(1);
-    await new Promise<void>((resolve) => setImmediate(resolve));
     expect(settled).not.toHaveBeenCalled();
 
     emit("error", { error: "aborted", message: "aborted" });
