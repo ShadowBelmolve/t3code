@@ -2282,7 +2282,7 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
           ? readBranchChangeTotals(worktreeRoot, refName, submodulePaths).pipe(
               Effect.orElseSucceed(() => undefined),
             )
-          : Effect.succeed(undefined),
+          : Effect.sync(() => undefined),
       ],
       { concurrency: 2 },
     );

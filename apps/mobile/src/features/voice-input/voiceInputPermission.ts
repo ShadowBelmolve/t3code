@@ -1,13 +1,9 @@
 type RecordingPermission = { readonly granted: boolean; readonly canAskAgain: boolean };
 
 /**
- * Asks for microphone access only when it is missing, and reports while the
- * system prompt may be open.
- *
- * Android delegates every request to the system permission activity, even when
- * access is already granted. That pauses the app's activity, which React Native
- * reports as an AppState `background` change, not iOS's `inactive`. Voice input
- * must not treat that pause as the user leaving the app.
+ * Asks only when access is missing, and reports while the system prompt may be open.
+ * Android's permission activity pauses the app. React Native reports that as
+ * AppState `background`, not iOS's `inactive`. Do not treat that pause as leaving.
  */
 export function createVoiceRecordingPermission(input: {
   readonly get: () => Promise<RecordingPermission>;
