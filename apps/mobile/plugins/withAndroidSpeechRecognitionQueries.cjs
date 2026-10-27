@@ -1,10 +1,9 @@
 const { withAndroidManifest } = require("expo/config-plugins");
 
 // Android 11+ hides other apps' services unless the manifest declares them.
-// Dictation transcribes through the system SpeechRecognizer, which can only
-// find the installed recognition service through this query. Added here
-// instead of through expo-speech-recognition's plugin, which also writes iOS
-// speech permission strings for a module the iOS app does not link.
+// SpeechRecognizer is only visible through this query. The expo-speech-recognition
+// plugin is not used: it also writes iOS speech permission strings for a module
+// the iOS app does not link.
 const RECOGNITION_SERVICE_ACTION = "android.speech.RecognitionService";
 
 module.exports = function withAndroidSpeechRecognitionQueries(config) {
