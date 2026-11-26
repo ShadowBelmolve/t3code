@@ -18169,6 +18169,117 @@ describe("ClaudeAdapterV2 background wake turns", () => {
     ),
   );
 
+  it.effect.each([{ arrives: "after-run-starts" }, { arrives: "before-run-starts" }])(
+    "shows an idle /compact from its start, with its frames arriving $arrives",
+    ({ arrives }) =>
+      Effect.gen(function* () {
+        const harness = yield* makeWakeHarness;
+        const now = yield* DateTime.now;
+
+        yield* harness.runtime.startTurn(
+          makeClaudeTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now,
+            attemptId: RunAttemptId.make("attempt-claude-idle-compact-1"),
+            text: "Do the work.",
+            attachments: [],
+          }),
+        );
+        yield* Queue.offer(harness.sdkMessages, turnOneResult);
+        yield* harness.awaitTerminal(1);
+
+        yield* harness.offerAndWait(
+          claudeSdkFrame({
+            type: "system",
+            subtype: "status",
+            status: "compacting",
+            uuid: "00000000-0000-4000-8000-000000000a01",
+            session_id: WAKE_NATIVE_SESSION,
+          }),
+        );
+        assert.lengthOf(harness.continuationRequests, 1);
+
+        const rest = [
+          claudeSdkFrame({
+            type: "system",
+            subtype: "status",
+            status: null,
+            compact_result: "success",
+            uuid: "00000000-0000-4000-8000-000000000a02",
+            session_id: WAKE_NATIVE_SESSION,
+          }),
+          claudeSdkFrame({
+            type: "system",
+            subtype: "compact_boundary",
+            compact_metadata: { trigger: "manual", pre_tokens: 9000, post_tokens: 900 },
+            uuid: "00000000-0000-4000-8000-000000000a03",
+            session_id: WAKE_NATIVE_SESSION,
+          }),
+          claudeSdkFrame({
+            type: "user",
+            message: { role: "user", content: "This session is being continued..." },
+            parent_tool_use_id: null,
+            uuid: "00000000-0000-4000-8000-000000000a04",
+            session_id: WAKE_NATIVE_SESSION,
+          }),
+          makeResultFrame({
+            uuid: "00000000-0000-4000-8000-000000000a05",
+            result: "",
+            numTurns: 0,
+          }),
+        ];
+        const compactionItems = () =>
+          harness.events.flatMap((event) =>
+            event.type === "turn_item.updated" && event.turnItem.type === "compaction"
+              ? [event.turnItem]
+              : [],
+          );
+        const startContinuation = harness.runtime.startTurn(
+          makeClaudeTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now,
+            attemptId: RunAttemptId.make("attempt-claude-idle-compact-2"),
+            text: "Background activity updated.",
+            attachments: [],
+            providerTurnOrdinal: 2,
+            messageCreatedBy: "agent",
+            messageCreationSource: "provider",
+          }),
+        );
+        if (arrives === "after-run-starts") {
+          yield* startContinuation;
+          yield* harness.until(() => compactionItems().length > 0);
+          assert.deepEqual(
+            compactionItems().map((item) => item.status),
+            ["running"],
+          );
+          for (const frame of rest) yield* Queue.offer(harness.sdkMessages, frame);
+        } else {
+          for (const frame of rest) yield* harness.offerAndWait(frame);
+          assert.lengthOf(harness.continuationRequests, 1);
+          yield* startContinuation;
+        }
+        yield* harness.awaitTerminal(2);
+        assert.equal(harness.terminalEvents()[1]?.status, "completed");
+        assert.equal(compactionItems()[0]?.status, "running");
+        const last = compactionItems().at(-1);
+        assert.equal(last?.status, "completed");
+        assert.equal(last?.title, "Context compacted");
+        assert.equal(new Set(compactionItems().map((item) => item.id)).size, 1);
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            IdAllocator.layer,
+            McpProviderSessions.layer,
+            NodeServices.layer,
+            NodeCrypto.layer,
+          ),
+        ),
+      ),
+  );
+
   it.effect("offers a later wake after an earlier wake's continuation dispatch failed", () =>
     Effect.gen(function* () {
       const SECOND_TASK_ID = "b2ndwake";
