@@ -9805,7 +9805,18 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             );
           }
           const isWakeTurnStart = isClaudeTurnStartMessage(message);
+          // Claude Code runs a /compact a hook issues after the turn ends while idle; show it as it runs.
+          const isIdleCompactionStart =
+            message.type === "system" &&
+            message.subtype === "status" &&
+            message.status === "compacting";
+          const isIdleCompactionFrame =
+            isIdleCompactionStart ||
+            (message.type === "system" &&
+              (message.subtype === "compact_boundary" ||
+                (message.subtype === "status" && message.compact_result !== undefined)));
           const isWakeEvidence =
+            isIdleCompactionFrame ||
             isPendingTaskNotification ||
             isPendingSubagentNotification ||
             isNestedSubagentNotification ||
@@ -9927,6 +9938,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             !isResumedSubagentTaskStarted &&
             !isNativeOpaqueWakeFrame &&
             !isWakeTurnStart &&
+            !isIdleCompactionStart &&
             message.type !== "result"
           ) {
             return;
